@@ -1,0 +1,8 @@
+$wslIP = (wsl hostname -I).Trim().Split()[0]
+Write-Host "WSL IP is: $wslIP"
+
+netsh interface portproxy add v4tov4 listenport=5117 listenaddress=0.0.0.0 connectport=5117 connectaddress=$wslIP
+
+New-NetFirewallRule -DisplayName "FlashShare" -Direction Inbound -LocalPort 5117 -Protocol TCP -Action Allow
+
+ipconfig

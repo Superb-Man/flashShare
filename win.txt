@@ -1,0 +1,17 @@
+cd C:\path\to\flashshare
+mkdir build
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR="C:\OpenSSL-Win64"
+flashshare.exe
+
+
+set OPENSSL_ROOT_DIR=C:\OpenSSL-Win64
+cmake .. -DCMAKE_BUILD_TYPE=Release
+
+
+flashshare.exe recv --port 5117 --out C:\Users\YourName\Downloads --accept-all
+
+
+flashshare.exe recv --port 5117 --out C:\Users\YourName\Downloads
+
+
