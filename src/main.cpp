@@ -24,6 +24,10 @@ int main(int argc, char* argv[]) {
         Logger::set_level(LogLevel::DEBUG);
     }
 
+    if (!args.log_file.empty()) {
+        Logger::set_log_file(args.log_file);
+    }
+
     switch (args.command) {
         case Command::NONE:
         case Command::HELP:
@@ -32,12 +36,12 @@ int main(int argc, char* argv[]) {
             return 0;
 
         case Command::SEND: {
-            Sender sender(args.filepath, args.to, args.port, args.encrypt, args.resume);
+            Sender sender(args.paths, args.to, args.port, args.encrypt, args.resume);
             return sender.run();
         }
 
         case Command::RECV: {
-            Receiver receiver(args.port, args.out_dir, args.accept_all, args.daemon);
+            Receiver receiver(args.port, args.out_dir, args.accept_all, args.daemon, args.log_file);
             return receiver.run();
         }
     }

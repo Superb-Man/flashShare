@@ -29,6 +29,7 @@ add_executable(flashshare
     src/crypto/cipher.cpp
     src/util/logger.cpp
     src/util/sha256.cpp
+    src/util/fs.cpp
 )
 
 target_include_directories(flashshare PRIVATE src)
@@ -37,6 +38,11 @@ target_link_libraries(flashshare PRIVATE
     ${OPENSSL_CRYPTO_LIBRARY}
     Threads::Threads
 )
+
+# GCC < 9 requires linking libstdc++fs explicitly for std::filesystem.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
+    target_link_libraries(flashshare PRIVATE stdc++fs)
+endif()
 
 # Windows: link Winsock libraries
 if(WIN32)

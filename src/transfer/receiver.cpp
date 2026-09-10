@@ -1,12 +1,15 @@
 #include "transfer/receiver.h"
 #include "net/listener.h"
 #include "util/logger.h"
+#include "util/fs.h"
+#include "util/sha256.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
+#include <chrono>
 
 #ifdef _WIN32
 #include <io.h>
@@ -34,8 +37,9 @@ static void signal_handler(int sig) {
 }
 #endif
 
-Receiver::Receiver(uint16_t port, const std::string& out_dir, bool accept_all, bool daemon)
-    : port_(port), out_dir_(out_dir), accept_all_(accept_all), daemon_(daemon) {}
+Receiver::Receiver(uint16_t port, const std::string& out_dir, bool accept_all, bool daemon,
+                    const std::string& log_file)
+    : port_(port), out_dir_(out_dir), accept_all_(accept_all), daemon_(daemon), log_file_(log_file) {}
 
 Receiver::~Receiver() {
     stop();
@@ -244,6 +248,20 @@ int Receiver::handle_connection(Connection& conn) {
 
     std::string sender_ip = conn.socket().peer_address();
 
+    // Manifest relpaths come from the remote peer — reject anything that
+    // could escape out_dir_ (absolute paths or ".." segments) before
+    // accepting the transfer.
+    for (const auto& f : req.files) {
+        if (!fs_is_safe_relpath(f.relpath)) {
+            LOG_ERROR("Rejecting transfer %s — unsafe path in manifest: %s",
+                      req.transfer_id.c_str(), f.relpath.c_str());
+            TransferResponse resp;
+            resp.accepted = false;
+            conn.send_transfer_response(resp);
+            return 1;
+        }
+    }
+
     if (!prompt_accept(sender_ip, req)) {
         LOG_INFO("Transfer rejected by user");
         TransferResponse resp;
@@ -266,6 +284,9 @@ int Receiver::handle_connection(Connection& conn) {
     LOG_INFO("Receiving transfer %s — %zu files, %llu bytes",
              req.transfer_id.c_str(), req.files.size(), (unsigned long long)req.total_size);
 
+    auto overall_start = std::chrono::steady_clock::now();
+    uint64_t overall_received = 0;
+
     for (size_t i = 0; i < req.files.size(); ++i) {
         uint32_t file_index;
         uint64_t file_size;
@@ -275,12 +296,20 @@ int Receiver::handle_connection(Connection& conn) {
             return 1;
         }
 
-        std::string out_path = out_dir_;
-        if (out_path.back() != '/') out_path += "/";
-        out_path += filename;
+        if (!fs_is_safe_relpath(filename)) {
+            LOG_ERROR("Rejecting unsafe file path in FILE_HEADER: %s", filename.c_str());
+            return 1;
+        }
+        std::string out_path = fs_join(out_dir_, filename);
 
-        LOG_INFO("Receiving: %s (%llu bytes) -> %s",
-                 filename.c_str(), (unsigned long long)file_size, out_path.c_str());
+        if (!fs_ensure_parent_dirs(out_path)) {
+            LOG_ERROR("Failed to create directories for: %s", out_path.c_str());
+            return 1;
+        }
+
+        LOG_INFO("[%zu/%zu] Receiving: %s (%llu bytes) -> %s",
+                 i + 1, req.files.size(), filename.c_str(),
+                 (unsigned long long)file_size, out_path.c_str());
 
         ProgressBar progress(filename, file_size);
 
@@ -290,8 +319,33 @@ int Receiver::handle_connection(Connection& conn) {
         }
 
         progress.finish();
+
+        // Verify integrity against the sender's SHA-256 (sent in the manifest).
+        const std::string& expected_hash = (i < req.files.size()) ? req.files[i].sha256 : std::string();
+        if (!expected_hash.empty()) {
+            std::string actual_hash = SHA256::file_hash(out_path);
+            if (actual_hash == expected_hash) {
+                LOG_DEBUG("Hash OK: %s (%s)", filename.c_str(), actual_hash.c_str());
+            } else {
+                LOG_ERROR("Hash MISMATCH for %s — expected %s, got %s",
+                          filename.c_str(), expected_hash.c_str(), actual_hash.c_str());
+                return 1;
+            }
+        } else {
+            LOG_DEBUG("No hash in manifest for %s, skipping verification", filename.c_str());
+        }
+
+        overall_received += file_size;
         LOG_INFO("File received: %s", out_path.c_str());
     }
+
+    double overall_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - overall_start).count();
+    double avg_mbps = overall_elapsed > 0
+        ? (static_cast<double>(overall_received) / overall_elapsed) / (1024.0 * 1024.0)
+        : 0.0;
+    LOG_INFO("Overall: %zu file(s), %llu bytes received in %.1fs (avg %.1f MB/s)",
+             req.files.size(), (unsigned long long)overall_received, overall_elapsed, avg_mbps);
 
     MessageType type;
     if (conn.recv_message(type) && type == MessageType::TRANSFER_COMPLETE) {
@@ -328,13 +382,26 @@ int Receiver::run() {
     // Daemonize if requested
     if (daemon_) {
         LOG_INFO("Starting in daemon mode...");
+
+        // stderr gets redirected to /dev/null once daemonized, so mirror log
+        // output to a file — otherwise all subsequent logging (including
+        // errors) is silently lost. Preserve whatever level was already set
+        // (e.g. --verbose) instead of resetting it.
+        std::string effective_log_file = log_file_.empty() ? "/tmp/flashshare_receiver.log"
+                                                             : log_file_;
+        LogLevel level_before_daemonize = Logger::get_level();
+
         if (!daemonize()) {
             LOG_ERROR("Failed to daemonize");
             return 1;
         }
-        // After daemonize, we're in the background child process
-        // Re-init logger since stderr was closed
-        Logger::set_level(LogLevel::INFO);
+
+        // After daemonize, we're in the background child process with
+        // stdin/stdout/stderr redirected to /dev/null.
+        Logger::set_level(level_before_daemonize);
+        if (Logger::set_log_file(effective_log_file)) {
+            LOG_INFO("Daemon logging to %s", effective_log_file.c_str());
+        }
     }
 
     // Set up signal handler for graceful shutdown

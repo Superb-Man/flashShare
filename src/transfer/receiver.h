@@ -17,7 +17,7 @@ namespace flashshare {
 class Receiver {
 public:
     Receiver(uint16_t port, const std::string& out_dir, bool accept_all,
-             bool daemon = false);
+             bool daemon = false, const std::string& log_file = "");
     ~Receiver();
 
     // Start listening and handle transfers (blocks until stopped)
@@ -31,6 +31,7 @@ private:
     std::string out_dir_;
     bool accept_all_;
     bool daemon_;
+    std::string log_file_;
     std::atomic<bool> running_{false};
 
     // Active transfer threads

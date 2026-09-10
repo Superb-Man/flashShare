@@ -13,11 +13,11 @@ static void print_help() {
         "FlashShare — High-speed LAN file transfer\n"
         "\n"
         "USAGE:\n"
-        "  flashshare send <file> --to <ip> [options]    Send a file to a peer\n"
+        "  flashshare send <path> [<path>...] --to <ip> [options]   Send files to a peer\n"
         "  flashshare recv [options]                      Receive files from a peer\n"
         "\n"
         "COMMANDS:\n"
-        "  send <path>    Send a file or directory\n"
+        "  send <path> [<path>...]   Send one or more files and/or directories\n"
         "  recv           Listen for incoming transfers\n"
         "  help            Show this help message\n"
         "  version         Show version\n"
@@ -31,12 +31,15 @@ static void print_help() {
         "  --accept-all    Auto-accept incoming transfers (no prompt)\n"
         "  --daemon        Run receiver in background (daemon mode)\n"
         "  --verbose       Enable debug logging\n"
+        "  --log-file <f>  Mirror log output to file (default in --daemon mode:\n"
+        "                  /tmp/flashshare_receiver.log)\n"
         "  -h, --help      Show help\n"
         "  -v, --version   Show version\n"
         "\n"
         "EXAMPLES:\n"
         "  flashshare send bigfile.iso --to 192.168.1.50\n"
         "  flashshare send ./project/ --to 192.168.1.50 --encrypt\n"
+        "  flashshare send a.txt b.txt ./project/ --to 192.168.1.50\n"
         "  flashshare recv --port 5117 --out ~/downloads\n"
         "\n"
     );
@@ -98,6 +101,8 @@ bool parse_args(int argc, char* argv[], Args& args) {
             args.accept_all = true;
         } else if (arg == "--verbose") {
             args.verbose = true;
+        } else if (arg == "--log-file" && i + 1 < argc) {
+            args.log_file = argv[++i];
         } else if (arg == "--daemon") {
             args.daemon = true;
         } else if (arg == "-h" || arg == "--help") {
@@ -108,8 +113,8 @@ bool parse_args(int argc, char* argv[], Args& args) {
             return false;
         } else {
             // Positional argument
-            if (args.command == Command::SEND && args.filepath.empty()) {
-                args.filepath = arg;
+            if (args.command == Command::SEND) {
+                args.paths.push_back(arg);
             } else {
                 args.extra.push_back(arg);
             }
@@ -117,8 +122,8 @@ bool parse_args(int argc, char* argv[], Args& args) {
     }
 
     // Validate
-    if (args.command == Command::SEND && args.filepath.empty()) {
-        fprintf(stderr, "Error: send requires a file path\n");
+    if (args.command == Command::SEND && args.paths.empty()) {
+        fprintf(stderr, "Error: send requires at least one file or directory path\n");
         print_help();
         return false;
     }

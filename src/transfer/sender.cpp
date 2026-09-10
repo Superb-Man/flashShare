@@ -1,5 +1,7 @@
 #include "transfer/sender.h"
 #include "util/logger.h"
+#include "util/fs.h"
+#include "util/sha256.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -8,19 +10,22 @@
 #include <random>
 #include <sstream>
 #include <iomanip>
+#include <chrono>
+#include <unordered_set>
 
 #ifdef _WIN32
 #include <io.h>
 #define S_ISREG(m) (((m) & 0170000) == 0100000)
+#define S_ISDIR(m) (((m) & 0170000) == 0040000)
 #else
 #include <unistd.h>
 #endif
 
 namespace flashshare {
 
-Sender::Sender(const std::string& filepath, const std::string& target_ip,
+Sender::Sender(const std::vector<std::string>& paths, const std::string& target_ip,
                uint16_t port, bool encrypt, bool resume)
-    : filepath_(filepath), target_ip_(target_ip), port_(port),
+    : paths_(paths), target_ip_(target_ip), port_(port),
       encrypt_(encrypt), resume_(resume) {}
 
 std::string Sender::generate_transfer_id() {
@@ -149,22 +154,75 @@ bool Sender::send_file(Connection& conn, const std::string& filepath,
     return true;
 }
 
+std::vector<FileEntry> Sender::build_manifest() {
+    std::vector<FileEntry> files;
+
+    for (const auto& path : paths_) {
+        if (fs_is_directory(path)) {
+            LOG_DEBUG("Walking directory: %s", path.c_str());
+            auto dir_files = fs_walk_directory(path);
+            files.insert(files.end(), dir_files.begin(), dir_files.end());
+        } else {
+            FileEntry entry;
+            entry.relpath = basename(path);
+            entry.abspath = path;
+            entry.size = get_file_size(path);
+            files.push_back(std::move(entry));
+        }
+    }
+
+    // Multiple source paths can legitimately produce the same relpath (e.g.
+    // two single files with the same basename) — warn since the receiver
+    // will silently overwrite one with the other.
+    std::unordered_set<std::string> seen;
+    for (const auto& entry : files) {
+        if (!seen.insert(entry.relpath).second) {
+            LOG_WARN("Duplicate path in manifest: %s (later file will overwrite it on the receiver)",
+                     entry.relpath.c_str());
+        }
+    }
+
+    for (auto& entry : files) {
+        entry.sha256 = SHA256::file_hash(entry.abspath);
+        LOG_DEBUG("Hashed %s -> %s", entry.relpath.c_str(), entry.sha256.c_str());
+    }
+
+    return files;
+}
+
 int Sender::run() {
-    // Check file exists
-    struct stat st;
-    if (stat(filepath_.c_str(), &st) != 0) {
-        LOG_ERROR("Cannot access file: %s — %s", filepath_.c_str(), strerror(errno));
+    if (paths_.empty()) {
+        LOG_ERROR("No paths to send");
         return 1;
     }
 
-    if (!S_ISREG(st.st_mode)) {
-        LOG_ERROR("Not a regular file: %s (directory support coming in Phase 3)", filepath_.c_str());
-        return 1;
+    // Check every path exists and is a file or directory before doing
+    // anything else, so a bad path fails fast instead of mid-transfer.
+    for (const auto& path : paths_) {
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) {
+            LOG_ERROR("Cannot access path: %s — %s", path.c_str(), strerror(errno));
+            return 1;
+        }
+        if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) {
+            LOG_ERROR("Not a regular file or directory: %s", path.c_str());
+            return 1;
+        }
     }
 
-    uint64_t file_size = static_cast<uint64_t>(st.st_size);
-    std::string filename = basename(filepath_);
     std::string transfer_id = generate_transfer_id();
+
+    std::vector<FileEntry> files = build_manifest();
+    if (files.empty()) {
+        LOG_ERROR("No files found in given paths");
+        return 1;
+    }
+
+    uint64_t total_size = 0;
+    for (const auto& f : files) total_size += f.size;
+
+    LOG_INFO("Prepared manifest: %zu file(s), %llu bytes total",
+             files.size(), (unsigned long long)total_size);
 
     LOG_INFO("FlashShare Sender — connecting to %s:%u", target_ip_.c_str(), port_);
 
@@ -196,14 +254,8 @@ int Sender::run() {
     req.transfer_id = transfer_id;
     req.encrypted = encrypt_;
     req.resume = resume_;
-    req.total_size = file_size;
-
-    FileEntry entry;
-    entry.relpath = filename;
-    entry.abspath = filepath_;
-    entry.size = file_size;
-    entry.sha256 = ""; // Phase 3 will add hashing
-    req.files.push_back(entry);
+    req.total_size = total_size;
+    req.files = files;
 
     // Send transfer request
     if (!conn.send_transfer_request(req)) {
@@ -223,18 +275,39 @@ int Sender::run() {
         return 1;
     }
 
-    LOG_INFO("Transfer accepted — sending %s (%llu bytes)",
-             filename.c_str(), (unsigned long long)file_size);
+    LOG_INFO("Transfer accepted — sending %zu file(s), %llu bytes",
+             files.size(), (unsigned long long)total_size);
 
-    // Send the file
-    ProgressBar progress(filename, file_size);
+    // Send each file. Per-file progress is shown live via ProgressBar;
+    // overall progress is reported as a running "[i/n]" counter plus a
+    // final aggregate summary.
+    auto overall_start = std::chrono::steady_clock::now();
+    uint64_t overall_sent = 0;
 
-    if (!send_file(conn, filepath_, 0, file_size, filename, progress)) {
-        LOG_ERROR("File transfer failed");
-        return 1;
+    for (size_t i = 0; i < files.size(); ++i) {
+        const FileEntry& entry = files[i];
+        LOG_INFO("[%zu/%zu] Sending %s (%llu bytes)",
+                 i + 1, files.size(), entry.relpath.c_str(), (unsigned long long)entry.size);
+
+        ProgressBar progress(entry.relpath, entry.size);
+
+        if (!send_file(conn, entry.abspath, static_cast<uint32_t>(i), entry.size,
+                       entry.relpath, progress)) {
+            LOG_ERROR("File transfer failed: %s", entry.relpath.c_str());
+            return 1;
+        }
+
+        progress.finish();
+        overall_sent += entry.size;
     }
 
-    progress.finish();
+    double overall_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - overall_start).count();
+    double avg_mbps = overall_elapsed > 0
+        ? (static_cast<double>(overall_sent) / overall_elapsed) / (1024.0 * 1024.0)
+        : 0.0;
+    LOG_INFO("Overall: %zu file(s), %llu bytes sent in %.1fs (avg %.1f MB/s)",
+             files.size(), (unsigned long long)overall_sent, overall_elapsed, avg_mbps);
 
     // Send TRANSFER_COMPLETE
     if (!conn.send_message(MessageType::TRANSFER_COMPLETE)) {
