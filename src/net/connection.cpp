@@ -241,6 +241,7 @@ std::string Connection::serialize_response(const TransferResponse& resp) {
     std::ostringstream ss;
     ss << "{";
     ss << "\"accepted\":" << (resp.accepted ? "true" : "false") << ",";
+    ss << "\"message\":\"" << json_escape(resp.message) << "\",";
     ss << "\"resume_offsets\":[";
     for (size_t i = 0; i < resp.resume_offsets.size(); ++i) {
         ss << resp.resume_offsets[i];
@@ -252,27 +253,41 @@ std::string Connection::serialize_response(const TransferResponse& resp) {
 
 bool Connection::deserialize_response(const std::string& json, TransferResponse& resp) {
     resp.accepted = json_get_bool(json, "accepted");
+    resp.message = json_get_string(json, "message");
     resp.resume_offsets = json_get_offsets(json);
     return true;
 }
 
-bool Connection::send_transfer_request(const TransferRequest& req) {
-    std::string json = serialize_request(req);
-    LOG_DEBUG("Sending transfer request: %zu files, %llu bytes",
-              req.files.size(), (unsigned long long)req.total_size);
-    return send_frame(MessageType::TRANSFER_REQUEST, json.data(), json.size());
+bool Connection::send_transfer_response(const TransferResponse& resp) {
+    std::string json = serialize_response(resp);
+    MessageType type = resp.accepted ? MessageType::TRANSFER_ACCEPT : MessageType::TRANSFER_REJECT;
+
+    return send_frame(type, json.data(), json.size());
 }
 
-bool Connection::recv_transfer_request(TransferRequest& req) {
+bool Connection::recv_transfer_response(TransferResponse& resp) {
     MessageType type;
     std::vector<uint8_t> payload;
+
     if (!recv_frame(type, payload)) return false;
-    if (type != MessageType::TRANSFER_REQUEST) {
-        LOG_ERROR("Expected TRANSFER_REQUEST, got %d", static_cast<int>(type));
+
+    if (type != MessageType::TRANSFER_ACCEPT && type != MessageType::TRANSFER_REJECT) {
+        LOG_ERROR("Expected TRANSFER_ACCEPT/REJECT, got %d", static_cast<int>(type));
         return false;
     }
+
     std::string json(payload.begin(), payload.end());
-    return deserialize_request(json, req);
+    if (!deserialize_response(json, resp)) {
+        return false;
+    }
+
+    // The message type is authoritative even if a malformed peer says
+    // `"accepted": true` in a rejection payload.
+    if (type == MessageType::TRANSFER_REJECT) {
+        resp.accepted = false;
+    }
+
+    return true;
 }
 
 bool Connection::send_transfer_response(const TransferResponse& resp) {
@@ -296,42 +311,67 @@ bool Connection::recv_transfer_response(TransferResponse& resp) {
     return deserialize_response(json, resp);
 }
 
-bool Connection::send_file_header(uint32_t file_index, uint64_t file_size, const std::string& filename) {
-    // Payload: [4 bytes: file_index][8 bytes: file_size][2 bytes: name_len][name]
+bool Connection::send_file_header(uint32_t file_index, uint64_t full_file_size, uint64_t file_offset, const std::string& filename) {
+    // Payload:
+    // [4 bytes: file_index]
+    // [8 bytes: complete original file size]
+    // [8 bytes: resume/send offset]
+    // [2 bytes: filename length]
+    // [n bytes: filename]
     size_t name_len = filename.size();
     if (name_len > 4096) name_len = 4096;
 
-    std::vector<uint8_t> payload(4 + 8 + 2 + name_len);
+    std::vector<uint8_t> payload(4 + 8 + 8 + 2 + name_len);
+
     memcpy(payload.data(), &file_index, 4);
-    memcpy(payload.data() + 4, &file_size, 8);
+    memcpy(payload.data() + 4, &full_file_size, 8);
+    memcpy(payload.data() + 12, &file_offset, 8);
+
     uint16_t nlen = static_cast<uint16_t>(name_len);
-    memcpy(payload.data() + 12, &nlen, 2);
-    memcpy(payload.data() + 14, filename.data(), name_len);
+    memcpy(payload.data() + 20, &nlen, 2);
+    memcpy(payload.data() + 22, filename.data(), name_len);
 
     return send_frame(MessageType::FILE_HEADER, payload.data(), payload.size());
 }
 
-bool Connection::recv_file_header(uint32_t& file_index, uint64_t& file_size, std::string& filename) {
+bool Connection::recv_file_header(uint32_t& file_index, uint64_t& full_file_size, uint64_t& file_offset, std::string& filename) {
     MessageType type;
     std::vector<uint8_t> payload;
+
     if (!recv_frame(type, payload)) return false;
+
     if (type != MessageType::FILE_HEADER) {
         LOG_ERROR("Expected FILE_HEADER, got %d", static_cast<int>(type));
         return false;
     }
-    if (payload.size() < 14) {
+
+    constexpr size_t FIXED_HEADER_SIZE = 4 + 8 + 8 + 2;
+    
+    if (payload.size() < FIXED_HEADER_SIZE) {
         LOG_ERROR("FILE_HEADER payload too small");
         return false;
     }
+
     memcpy(&file_index, payload.data(), 4);
-    memcpy(&file_size, payload.data() + 4, 8);
+    memcpy(&full_file_size, payload.data() + 4, 8);
+    memcpy(&file_offset, payload.data() + 12, 8);
+
     uint16_t nlen = 0;
-    memcpy(&nlen, payload.data() + 12, 2);
-    if (payload.size() < 14 + nlen) {
-        LOG_ERROR("FILE_HEADER filename truncated");
+    memcpy(&nlen, payload.data() + 20, 2);
+
+    if (payload.size() != FIXED_HEADER_SIZE + nlen) {
+        LOG_ERROR("Invalid FILE_HEADER filename length");
         return false;
     }
-    filename.assign(reinterpret_cast<const char*>(payload.data() + 14), nlen);
+
+    if (file_offset > full_file_size) {
+        LOG_ERROR("Invalid FILE_HEADER offset: %llu > %llu",
+                  static_cast<unsigned long long>(file_offset),
+                  static_cast<unsigned long long>(full_file_size));
+        return false;
+    }
+
+    filename.assign(reinterpret_cast<const char*>(payload.data() + 22), nlen);
     return true;
 }
 

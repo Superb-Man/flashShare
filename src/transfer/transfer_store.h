@@ -7,6 +7,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <unordered_set>
+#include <unordered_map>
 
 namespace flashshare {
 
@@ -74,17 +76,21 @@ public:
 
     // Mark a connection as owning this transfer. False means another live
     // connection already owns it; this prevents concurrent writes to .part files.
-    bool acquire_session(const std::string& transfer_id);
-    void release_session(const std::string& transfer_id);
+    bool acquire_session(const std::string& sender_public_ip, const std::string& transfer_id);
 
-    // Save an offset only after the partial file write has succeeded.
-    bool checkpoint(const std::string& transfer_id, uint32_t file_index, uint64_t durable_bytes);
-    bool complete_file(const std::string& transfer_id, uint32_t file_index);
-    bool complete_transfer(const std::string& transfer_id);
+    void release_session(const std::string& sender_public_ip, const std::string& transfer_id);
+
+    bool checkpoint(const std::string& sender_public_ip, const std::string& transfer_id, uint32_t file_index, uint64_t durable_bytes);
+
+    bool complete_file(const std::string& sender_public_ip, const std::string& transfer_id, uint32_t file_index);
+
+    bool complete_transfer(const std::string& sender_public_ip, const std::string& transfer_id);
 
 private:
     std::string out_dir_;
     mutable std::mutex mutex_;
+    std::unordered_set<std::string> active_sessions_;
+    std::unordered_map<std::string, StoredTransfer> open_transfers_;
 
     std::string sender_dir(const std::string& sender_public_ip) const;
     std::string journal_path(const std::string& sender_public_ip, const std::string& transfer_id) const;
