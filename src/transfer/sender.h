@@ -20,6 +20,12 @@ public:
     int run();
 
 private:
+    struct TransferSession {
+        std::string transfer_id;
+        std::vector<FileEntry> files;
+        uint64_t total_size = 0;
+    };
+
     std::vector<std::string> paths_;
     std::string target_ip_;
     uint16_t port_;
@@ -37,9 +43,34 @@ private:
     // file so the receiver can verify integrity after transfer.
     std::vector<FileEntry> build_manifest();
 
-    bool send_file(Connection& conn, const std::string& filepath,
-                   uint32_t file_index, uint64_t file_size,
-                   const std::string& filename, ProgressBar& progress);
+    /*
+     * Sends one file beginning at receiver_confirmed_offset.
+     * The FILE_HEADER still contains the full file size; the receiver knows
+     * where to append from its recovery journal.
+     */
+    bool send_file(Connection& conn,
+                   const FileEntry& file,
+                   uint32_t file_index,
+                   uint64_t receiver_confirmed_offset,
+                   ProgressBar& progress);
+
+    /*
+     * Creates a new TCP connection, resends the same transfer ID and manifest,
+     * then obtains authoritative per-file offsets from the receiver.
+     */
+    bool connect_and_negotiate(const TransferSession& session,
+                               Connection& conn,
+                               std::vector<uint64_t>& resume_offsets);
+
+    /*
+     * One connection attempt. A broken connection returns false; run() then
+     * reconnects using the same TransferSession / transfer_id.
+     */
+    bool send_attempt(const TransferSession& session,
+                      Connection& conn,
+                      const std::vector<uint64_t>& resume_offsets);
+
+    bool wait_before_retry(unsigned int failed_attempt) const;
 };
 
 } // namespace flashshare

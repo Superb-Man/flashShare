@@ -3,15 +3,20 @@
 #include "net/connection.h"
 #include "net/threadpool.h"
 #include "cli/progress.h"
-#include <string>
+
 #include <atomic>
 #include <memory>
+#include <string>
 
 namespace flashshare {
 
+class TransferStore;
+struct StoredTransfer;
+struct StoredFileProgress;
+
 /**
- * Receiver: listens for incoming transfers and writes files to disk.
- * Supports concurrent transfers (one thread per connection) and daemon mode.
+ * Receiver: accepts multiple sender connections and receives each connection
+ * on a thread-pool worker. TransferStore persists per-file recovery state.
  */
 class Receiver {
 public:
@@ -19,10 +24,7 @@ public:
              bool daemon = false, const std::string& log_file = "");
     ~Receiver();
 
-    // Start listening and handle transfers (blocks until stopped)
     int run();
-
-    // Request graceful stop (signal-safe)
     void stop();
 
 private:
@@ -33,30 +35,27 @@ private:
     std::string log_file_;
     std::atomic<bool> running_{false};
 
-    // Created after daemonization so fork() never occurs in a multithreaded process.
     std::unique_ptr<ThreadPool> thread_pool_;
 
-    // Handle a single incoming connection (runs in its own thread)
-    void handle_connection_thread(Socket client);
+    // For recovery
+    std::unique_ptr<TransferStore> transfer_store_;
 
-    // Handle a single incoming connection
+    void handle_connection_thread(Socket client);
     int handle_connection(Connection& conn);
 
-    // Receive a single file
-    bool recv_file(Connection& conn, const std::string& out_path,
-                   uint64_t file_size, bool encrypted, ProgressBar& progress);
-
-    // Prompt user to accept/reject
+    /*
+     * Receives only the missing range of one file into its .part file.
+     *
+     * file_progress.durable_bytes is the receiver-confirmed resume offset.
+     * It is checkpointed as data is safely written. This function must never
+     * truncate the partial file during a resume.
+     */
+    bool recv_file(Connection& conn, StoredTransfer& transfer, StoredFileProgress& file_progress, bool encrypted, ProgressBar& progress);
     bool prompt_accept(const std::string& sender_ip, const TransferRequest& req);
 
-    // Daemonize the process (fork into background)
     bool daemonize();
-
-    // Write PID file
     bool write_pid_file();
     void remove_pid_file();
-
-    // Get PID file path
     std::string pid_file_path() const;
 };
 
