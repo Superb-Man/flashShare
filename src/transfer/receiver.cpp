@@ -43,9 +43,8 @@ Receiver::Receiver(uint16_t port, const std::string& out_dir, bool accept_all, b
 
 Receiver::~Receiver() {
     stop();
-    // Join any remaining threads
-    for (auto& t : threads_) {
-        if (t.joinable()) t.join();
+    if (thread_pool_) {
+        thread_pool_->stop(false);
     }
     if (daemon_) {
         remove_pid_file();
@@ -423,6 +422,8 @@ int Receiver::run() {
         return 1;
     }
 
+    // Create workers only after daemonization: forking with live threads is unsafe.
+    thread_pool_ = std::make_unique<ThreadPool>();
     running_ = true;
     LOG_INFO("Waiting for incoming connections... (Ctrl+C to stop)");
 
@@ -438,32 +439,20 @@ int Receiver::run() {
 
         LOG_INFO("Connection from %s:%u", client.peer_address().c_str(), client.peer_port());
 
-        // Spawn a thread for this connection (concurrent transfers)
-        threads_.emplace_back(&Receiver::handle_connection_thread, this, std::move(client));
 
-        // Clean up finished threads periodically
-        threads_.erase(
-            std::remove_if(threads_.begin(), threads_.end(),
-                [](std::thread& t) {
-                    if (t.joinable()) {
-                        // Try to join non-blocking — if thread is done, join it
-                        // Otherwise skip
-                        // We use a simple approach: detach threads instead
-                        return false;
-                    }
-                    return true;
-                }),
-            threads_.end()
-        );
+        auto pending_client = std::make_shared<Socket>(std::move(client));
+        if (!thread_pool_->enqueue([this, pending_client] {
+                handle_connection_thread(std::move(*pending_client));
+            })) {
+            LOG_WARN("Connection queue is full; rejecting connection from %s",
+                     pending_client->peer_address().c_str());
+        }
     }
-
-    // Detach all remaining threads on shutdown
-    for (auto& t : threads_) {
-        if (t.joinable()) t.detach();
-    }
-    threads_.clear();
 
     listener.stop();
+    if (thread_pool_) {
+        thread_pool_->stop(true);
+    }
     LOG_INFO("Receiver stopped.");
 
     if (daemon_) {

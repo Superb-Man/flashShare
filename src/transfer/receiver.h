@@ -1,11 +1,10 @@
 #pragma once
 
 #include "net/connection.h"
+#include "net/threadpool.h"
 #include "cli/progress.h"
 #include <string>
 #include <atomic>
-#include <vector>
-#include <thread>
 #include <memory>
 
 namespace flashshare {
@@ -34,8 +33,8 @@ private:
     std::string log_file_;
     std::atomic<bool> running_{false};
 
-    // Active transfer threads
-    std::vector<std::thread> threads_;
+    // Created after daemonization so fork() never occurs in a multithreaded process.
+    std::unique_ptr<ThreadPool> thread_pool_;
 
     // Handle a single incoming connection (runs in its own thread)
     void handle_connection_thread(Socket client);
