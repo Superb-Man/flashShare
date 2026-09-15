@@ -265,6 +265,36 @@ bool Connection::send_transfer_response(const TransferResponse& resp) {
     return send_frame(type, json.data(), json.size());
 }
 
+
+bool Connection::send_transfer_request(const TransferRequest& req) {
+    std::string json = serialize_request(req);
+
+    LOG_DEBUG("Sending transfer request: %zu files, %llu bytes", req.files.size(), static_cast<unsigned long long>(req.total_size));
+
+    return send_frame(
+        MessageType::TRANSFER_REQUEST,
+        json.data(),
+        json.size()
+    );
+}
+
+bool Connection::recv_transfer_request(TransferRequest& req) {
+    MessageType type;
+    std::vector<uint8_t> payload;
+
+    if (!recv_frame(type, payload)) {
+        return false;
+    }
+
+    if (type != MessageType::TRANSFER_REQUEST) {
+        LOG_ERROR("Expected TRANSFER_REQUEST, got %d", static_cast<int>(type));
+        return false;
+    }
+
+    std::string json(payload.begin(), payload.end());
+    return deserialize_request(json, req);
+}
+
 bool Connection::recv_transfer_response(TransferResponse& resp) {
     MessageType type;
     std::vector<uint8_t> payload;
@@ -288,27 +318,6 @@ bool Connection::recv_transfer_response(TransferResponse& resp) {
     }
 
     return true;
-}
-
-bool Connection::send_transfer_response(const TransferResponse& resp) {
-    std::string json = serialize_response(resp);
-    return send_frame(MessageType::TRANSFER_ACCEPT, json.data(), json.size());
-}
-
-bool Connection::recv_transfer_response(TransferResponse& resp) {
-    MessageType type;
-    std::vector<uint8_t> payload;
-    if (!recv_frame(type, payload)) return false;
-    if (type != MessageType::TRANSFER_ACCEPT && type != MessageType::TRANSFER_REJECT) {
-        LOG_ERROR("Expected TRANSFER_ACCEPT/REJECT, got %d", static_cast<int>(type));
-        return false;
-    }
-    if (type == MessageType::TRANSFER_REJECT) {
-        resp.accepted = false;
-        return true;
-    }
-    std::string json(payload.begin(), payload.end());
-    return deserialize_response(json, resp);
 }
 
 bool Connection::send_file_header(uint32_t file_index, uint64_t full_file_size, uint64_t file_offset, const std::string& filename) {
@@ -346,7 +355,7 @@ bool Connection::recv_file_header(uint32_t& file_index, uint64_t& full_file_size
     }
 
     constexpr size_t FIXED_HEADER_SIZE = 4 + 8 + 8 + 2;
-    
+
     if (payload.size() < FIXED_HEADER_SIZE) {
         LOG_ERROR("FILE_HEADER payload too small");
         return false;

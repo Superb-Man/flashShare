@@ -59,7 +59,7 @@ private:
      * then obtains authoritative per-file offsets from the receiver.
      */
     bool connect_and_negotiate(const TransferSession& session,
-                               Connection& conn,
+                               std::unique_ptr<Connection>& conn,
                                std::vector<uint64_t>& resume_offsets);
 
     /*

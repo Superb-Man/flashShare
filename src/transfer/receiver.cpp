@@ -3,6 +3,7 @@
 #include "util/logger.h"
 #include "util/fs.h"
 #include "util/sha256.h"
+#include "transfer/transfer_store.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -154,33 +155,88 @@ bool Receiver::prompt_accept(const std::string& sender_ip, const TransferRequest
     return buf[0] == 'y' || buf[0] == 'Y';
 }
 
-bool Receiver::recv_file(Connection& conn, const std::string& out_path,
-                          uint64_t file_size, bool encrypted, ProgressBar& progress) {
-    int fd = ::open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        LOG_ERROR("Cannot create output file: %s — %s", out_path.c_str(), strerror(errno));
+bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
+                         StoredFileProgress& file,
+                         bool encrypted,
+                         ProgressBar& progress) {
+    // A sender still sends FILE_COMPLETE for an already-complete file when it
+    // reconnects. Consume it, but never recreate or truncate the final file.
+    if (file.completed) {
+        MessageType type;
+        if (!conn.recv_message(type) || type != MessageType::FILE_COMPLETE) {
+            LOG_ERROR("Expected FILE_COMPLETE for already completed file");
+            return false;
+        }
+        return true;
+    }
+
+    // A new transfer has no partial-file directory yet.
+    if (!fs_ensure_parent_dirs(file.partial_path)) {
+        LOG_ERROR("Cannot create partial-file directory for %s", file.partial_path.c_str());
         return false;
     }
 
-    uint64_t received = 0;
+    int fd = ::open(file.partial_path.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        LOG_ERROR("Cannot open partial file %s: %s",
+                  file.partial_path.c_str(), strerror(errno));
+        return false;
+    }
+
+    uint64_t received = file.durable_bytes;
+
+    // Any bytes after the last journal checkpoint were not confirmed durable.
+    // Remove them and let the sender safely resend that small range.
+    if (ftruncate(fd, static_cast<off_t>(received)) < 0 ||
+        lseek(fd, static_cast<off_t>(received), SEEK_SET) < 0) {
+        LOG_ERROR("Cannot seek partial file %s: %s",
+                  file.partial_path.c_str(), strerror(errno));
+        ::close(fd);
+        return false;
+    }
+
+    progress.update(received);
+
+    auto checkpoint = [&]() -> bool {
+        if (fsync(fd) < 0) {
+            LOG_ERROR("Cannot sync partial file %s: %s",
+                      file.partial_path.c_str(), strerror(errno));
+            return false;
+        }
+
+        if (!transfer_store_->checkpoint(
+                transfer.sender_public_ip,
+                transfer.transfer_id,
+                file.file_index,
+                received)) {
+            return false;
+        }
+
+        file.durable_bytes = received;
+        return true;
+    };
 
     if (!encrypted) {
-        constexpr size_t BUF_SIZE = 256 * 1024;
-        std::vector<uint8_t> buffer(BUF_SIZE);
+        constexpr size_t BUFFER_SIZE = 256 * 1024;
+        constexpr uint64_t CHECKPOINT_INTERVAL = 4 * 1024 * 1024;
 
-        while (received < file_size) {
-            size_t to_read = BUF_SIZE;
-            if (file_size - received < BUF_SIZE) {
-                to_read = static_cast<size_t>(file_size - received);
-            }
+        std::vector<uint8_t> buffer(BUFFER_SIZE);
+        uint64_t last_checkpoint = received;
 
-            ssize_t n = conn.socket().recv(buffer.data(), to_read, 0);
+        while (received < file.expected_size) {
+            const size_t wanted = static_cast<size_t>(
+                std::min<uint64_t>(BUFFER_SIZE, file.expected_size - received)
+            );
+
+            ssize_t n = conn.socket().recv(buffer.data(), wanted, 0);
             if (n < 0) {
                 if (errno == EINTR) continue;
+
                 LOG_ERROR("recv failed: %s", strerror(errno));
                 ::close(fd);
                 return false;
             }
+
             if (n == 0) {
                 LOG_ERROR("Connection closed during file transfer");
                 ::close(fd);
@@ -189,9 +245,10 @@ bool Receiver::recv_file(Connection& conn, const std::string& out_path,
 
             ssize_t written = 0;
             while (written < n) {
-                ssize_t w = ::write(fd, buffer.data() + written, static_cast<size_t>(n) - written);
+                ssize_t w = ::write(fd, buffer.data() + written, static_cast<size_t>(n - written));
                 if (w < 0) {
                     if (errno == EINTR) continue;
+
                     LOG_ERROR("write failed: %s", strerror(errno));
                     ::close(fd);
                     return false;
@@ -201,43 +258,107 @@ bool Receiver::recv_file(Connection& conn, const std::string& out_path,
 
             received += static_cast<uint64_t>(n);
             progress.update(received);
+
+            if (received - last_checkpoint >= CHECKPOINT_INTERVAL) {
+                if (!checkpoint()) {
+                    ::close(fd);
+                    return false;
+                }
+                last_checkpoint = received;
+            }
         }
     } else {
-        while (received < file_size) {
-            std::vector<uint8_t> data;
-            uint32_t seq = 0;
 
-            if (!conn.recv_data_chunk(data, seq)) {
-                LOG_ERROR("Failed to receive data chunk");
+        uint32_t expected_seq = static_cast<uint32_t>(received / CHUNK_SIZE);
+
+        while (received < file.expected_size) {
+            std::vector<uint8_t> data;
+            uint32_t sequence = 0;
+
+            if (!conn.recv_data_chunk(data, sequence)) {
+                LOG_ERROR("Failed to receive encrypted data chunk");
                 ::close(fd);
                 return false;
             }
 
-            ssize_t n = ::write(fd, data.data(), data.size());
-            if (n < 0 || static_cast<size_t>(n) != data.size()) {
-                LOG_ERROR("write failed: %s", strerror(errno));
+            if (sequence != expected_seq ||
+                data.empty() ||
+                data.size() > file.expected_size - received) {
+                LOG_ERROR("Invalid encrypted chunk for file %u", file.file_index);
                 ::close(fd);
                 return false;
+            }
+
+            size_t written = 0;
+            while (written < data.size()) {
+                ssize_t n = ::write(fd, data.data() + written, data.size() - written);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+
+                    LOG_ERROR("write failed: %s", strerror(errno));
+                    ::close(fd);
+                    return false;
+                }
+                written += static_cast<size_t>(n);
             }
 
             received += data.size();
+            ++expected_seq;
             progress.update(received);
+
+            if (!checkpoint()) {
+                ::close(fd);
+                return false;
+            }
         }
     }
 
-    if (fsync(fd) < 0) {
-        LOG_WARN("fsync failed: %s", strerror(errno));
+    if (!checkpoint()) {
+        ::close(fd);
+        return false;
     }
+
     ::close(fd);
 
     MessageType type;
     if (!conn.recv_message(type) || type != MessageType::FILE_COMPLETE) {
-        LOG_WARN("Expected FILE_COMPLETE, got %d", static_cast<int>(type));
+        LOG_ERROR("Expected FILE_COMPLETE after file data");
+        return false;
     }
 
     return true;
 }
 
+// Handles one accepted sender connection on a thread-pool worker.
+//
+// Recovery identity:
+// - sender_public_ip selects the receiver output directory:
+//     <out-dir>/<sender-public-ip>/
+// - transfer_id selects the persistent recovery journal inside that directory.
+// - The journal contains every file's allocated final name, .part path,
+//   expected size/hash, and receiver-confirmed durable byte offset.
+//
+// Connection flow:
+// 1. Receive and validate the sender manifest.
+// 2. Ask the user to accept, unless --accept-all is enabled.
+// 3. Load an existing journal for this sender IP + transfer ID, or create a
+//    new journal and reserve unique final filenames such as "file (1).txt".
+// 4. Lock this transfer so two live connections cannot write the same .part
+//    file at the same time.
+// 5. Return one durable resume offset per manifest file.
+// 6. For every FILE_HEADER, verify index, path, full size, and sender offset
+//    exactly match the saved receiver state before accepting file bytes.
+// 7. Receive remaining bytes into .part files, verify SHA-256, then atomically
+//    rename each verified .part file to its reserved final destination.
+// 8. Mark the whole journal complete only after TRANSFER_COMPLETE arrives.
+//
+// If the connection breaks at any point, this function returns while retaining
+// the journal and .part files. A later sender reconnect with the same
+// transfer_id receives the stored offsets and continues safely.
+//
+// Note: peer_address() is the IP visible to this receiver. On a LAN it is
+// normally the sender's private LAN IP; it is a public IP only when that is
+// what the TCP connection exposes.
 int Receiver::handle_connection(Connection& conn) {
     TransferRequest req;
     if (!conn.recv_transfer_request(req)) {
@@ -245,113 +366,167 @@ int Receiver::handle_connection(Connection& conn) {
         return 1;
     }
 
-    std::string sender_ip = conn.socket().peer_address();
+    const std::string sender_public_ip = conn.socket().peer_address();
 
-    // Manifest relpaths come from the remote peer — reject anything that
-    // could escape out_dir_ (absolute paths or ".." segments) before
-    // accepting the transfer.
-    for (const auto& f : req.files) {
-        if (!fs_is_safe_relpath(f.relpath)) {
-            LOG_ERROR("Rejecting transfer %s — unsafe path in manifest: %s",
-                      req.transfer_id.c_str(), f.relpath.c_str());
-            TransferResponse resp;
-            resp.accepted = false;
-            conn.send_transfer_response(resp);
-            return 1;
+    auto reject = [&](const std::string& reason) {
+        LOG_ERROR("Rejecting transfer %s: %s",
+                  req.transfer_id.c_str(), reason.c_str());
+
+        TransferResponse response;
+        response.accepted = false;
+        response.message = reason;
+        conn.send_transfer_response(response);
+        return 1;
+    };
+
+    if (req.version != PROTOCOL_VERSION) {
+        return reject("protocol version mismatch");
+    }
+
+    if (req.transfer_id.empty()) {
+        return reject("missing transfer ID");
+    }
+
+    for (const auto& file : req.files) {
+        if (!fs_is_safe_relpath(file.relpath)) {
+            return reject("unsafe path in transfer manifest");
         }
     }
 
-    if (!prompt_accept(sender_ip, req)) {
-        LOG_INFO("Transfer rejected by user");
-        TransferResponse resp;
-        resp.accepted = false;
-        conn.send_transfer_response(resp);
+    // A first connection still needs user approval. With --accept-all this
+    // returns immediately; later refinement can skip this prompt for an
+    // already-approved recovered journal.
+    if (!prompt_accept(sender_public_ip, req)) {
+        TransferResponse response;
+        response.accepted = false;
+        response.message = "transfer rejected by receiver user";
+        conn.send_transfer_response(response);
         return 1;
     }
 
-    TransferResponse resp;
-    resp.accepted = true;
-    for (size_t i = 0; i < req.files.size(); ++i) {
-        resp.resume_offsets.push_back(0);
+    auto stored_transfer =
+        transfer_store_->open_or_create(sender_public_ip, req);
+
+    if (!stored_transfer) {
+        return reject("cannot create or validate transfer recovery state");
     }
 
-    if (!conn.send_transfer_response(resp)) {
+    if (!transfer_store_->acquire_session(
+            sender_public_ip, stored_transfer->transfer_id)) {
+        return reject("this transfer is already active");
+    }
+
+    struct SessionRelease {
+        TransferStore* store;
+        std::string sender_ip;
+        std::string transfer_id;
+
+        ~SessionRelease() {
+            store->release_session(sender_ip, transfer_id);
+        }
+    } release{
+        transfer_store_.get(),
+        sender_public_ip,
+        stored_transfer->transfer_id
+    };
+
+    TransferResponse response;
+    response.accepted = true;
+    response.resume_offsets =
+        transfer_store_->resume_offsets(*stored_transfer);
+
+    if (!conn.send_transfer_response(response)) {
         LOG_ERROR("Failed to send transfer response");
         return 1;
     }
 
-    LOG_INFO("Receiving transfer %s — %zu files, %llu bytes",
-             req.transfer_id.c_str(), req.files.size(), (unsigned long long)req.total_size);
+    LOG_INFO("Receiving transfer %s from %s — %zu files",
+             stored_transfer->transfer_id.c_str(),
+             sender_public_ip.c_str(),
+             stored_transfer->files.size());
 
-    auto overall_start = std::chrono::steady_clock::now();
-    uint64_t overall_received = 0;
+    const auto overall_start = std::chrono::steady_clock::now();
 
-    for (size_t i = 0; i < req.files.size(); ++i) {
-        uint32_t file_index;
-        uint64_t file_size;
+    for (size_t i = 0; i < stored_transfer->files.size(); ++i) {
+        StoredFileProgress& stored_file = stored_transfer->files[i];
+
+        uint32_t file_index = 0;
+        uint64_t full_file_size = 0;
+        uint64_t file_offset = 0;
         std::string filename;
-        if (!conn.recv_file_header(file_index, file_size, filename)) {
+
+        if (!conn.recv_file_header(file_index, full_file_size, file_offset, filename)) {
             LOG_ERROR("Failed to receive file header");
             return 1;
         }
 
-        if (!fs_is_safe_relpath(filename)) {
-            LOG_ERROR("Rejecting unsafe file path in FILE_HEADER: %s", filename.c_str());
+        // Files must arrive in manifest order. This keeps raw-byte boundaries
+        // unambiguous and matches the sender's one-connection batch format.
+        if (file_index != i ||
+            filename != stored_file.requested_relpath ||
+            full_file_size != stored_file.expected_size ||
+            file_offset != stored_file.durable_bytes) {
+            LOG_ERROR("Invalid resume header for transfer %s, file %zu", stored_transfer->transfer_id.c_str(), i);
             return 1;
         }
-        std::string out_path = fs_join(out_dir_, filename);
 
-        if (!fs_ensure_parent_dirs(out_path)) {
-            LOG_ERROR("Failed to create directories for: %s", out_path.c_str());
+        LOG_INFO("[%zu/%zu] Receiving %s at offset %llu/%llu",
+                 i + 1,
+                 stored_transfer->files.size(),
+                 stored_file.final_relpath.c_str(),
+                 static_cast<unsigned long long>(file_offset),
+                 static_cast<unsigned long long>(full_file_size));
+
+        ProgressBar progress(stored_file.final_relpath, stored_file.expected_size);
+
+        if (!recv_file(conn, *stored_transfer, stored_file, req.encrypted, progress)) {
+            LOG_ERROR("Failed to receive file: %s",
+                      stored_file.requested_relpath.c_str());
             return 1;
         }
 
-        LOG_INFO("[%zu/%zu] Receiving: %s (%llu bytes) -> %s",
-                 i + 1, req.files.size(), filename.c_str(),
-                 (unsigned long long)file_size, out_path.c_str());
+        // On a reconnect, a file already marked complete was only consumed
+        // above; never hash or rename it again.
+        if (!stored_file.completed) {
+            if (!stored_file.expected_sha256.empty()) {
+                const std::string actual_hash = SHA256::file_hash(stored_file.partial_path);
 
-        ProgressBar progress(filename, file_size);
+                if (actual_hash != stored_file.expected_sha256) {
+                    LOG_ERROR("Hash mismatch for %s", stored_file.requested_relpath.c_str());
+                    return 1;
+                }
+            }
 
-        if (!recv_file(conn, out_path, file_size, req.encrypted, progress)) {
-            LOG_ERROR("Failed to receive file: %s", filename.c_str());
-            return 1;
+            if (!transfer_store_->complete_file(
+                    sender_public_ip,
+                    stored_transfer->transfer_id,
+                    stored_file.file_index)) {
+                LOG_ERROR("Failed to finalize received file: %s",
+                          stored_file.final_relpath.c_str());
+                return 1;
+            }
+
+            stored_file.completed = true;
         }
 
         progress.finish();
-
-        // Verify integrity against the sender's SHA-256 (sent in the manifest).
-        const std::string& expected_hash = (i < req.files.size()) ? req.files[i].sha256 : std::string();
-        if (!expected_hash.empty()) {
-            std::string actual_hash = SHA256::file_hash(out_path);
-            if (actual_hash == expected_hash) {
-                LOG_DEBUG("Hash OK: %s (%s)", filename.c_str(), actual_hash.c_str());
-            } else {
-                LOG_ERROR("Hash MISMATCH for %s — expected %s, got %s",
-                          filename.c_str(), expected_hash.c_str(), actual_hash.c_str());
-                return 1;
-            }
-        } else {
-            LOG_DEBUG("No hash in manifest for %s, skipping verification", filename.c_str());
-        }
-
-        overall_received += file_size;
-        LOG_INFO("File received: %s", out_path.c_str());
     }
-
-    double overall_elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - overall_start).count();
-    double avg_mbps = overall_elapsed > 0
-        ? (static_cast<double>(overall_received) / overall_elapsed) / (1024.0 * 1024.0)
-        : 0.0;
-    LOG_INFO("Overall: %zu file(s), %llu bytes received in %.1fs (avg %.1f MB/s)",
-             req.files.size(), (unsigned long long)overall_received, overall_elapsed, avg_mbps);
 
     MessageType type;
-    if (conn.recv_message(type) && type == MessageType::TRANSFER_COMPLETE) {
-        LOG_INFO("Transfer complete: %s", req.transfer_id.c_str());
-    } else {
-        LOG_WARN("Did not receive TRANSFER_COMPLETE");
+    if (!conn.recv_message(type) || type != MessageType::TRANSFER_COMPLETE) {
+        LOG_ERROR("Expected TRANSFER_COMPLETE");
+        return 1;
     }
+
+    if (!transfer_store_->complete_transfer( sender_public_ip, stored_transfer->transfer_id)) {
+        LOG_ERROR("Failed to mark transfer complete: %s",
+                  stored_transfer->transfer_id.c_str());
+        return 1;
+    }
+
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - overall_start).count();
+
+    LOG_INFO("Transfer complete: %s (%.1fs)", stored_transfer->transfer_id.c_str(), elapsed);
 
     return 0;
 }
@@ -370,13 +545,14 @@ void Receiver::handle_connection_thread(Socket client) {
 int Receiver::run() {
     LOG_INFO("FlashShare Receiver — listening on port %u", port_);
     LOG_INFO("Output directory: %s", out_dir_.c_str());
-
     // Ensure output directory exists
     struct stat st;
     if (stat(out_dir_.c_str(), &st) != 0) {
         LOG_ERROR("Output directory does not exist: %s", out_dir_.c_str());
         return 1;
     }
+
+    transfer_store_ = std::make_unique<TransferStore>(out_dir_);
 
     // Daemonize if requested
     if (daemon_) {

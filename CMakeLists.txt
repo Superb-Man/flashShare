@@ -24,7 +24,9 @@ add_executable(flashshare
     src/net/socket.cpp
     src/net/listener.cpp
     src/net/connection.cpp
+    src/net/threadpool.cpp
     src/transfer/sender.cpp
+    src/transfer/transfer_store.cpp
     src/transfer/receiver.cpp
     src/crypto/cipher.cpp
     src/util/logger.cpp
