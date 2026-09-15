@@ -54,6 +54,34 @@ Receiver::~Receiver() {
 
 void Receiver::stop() {
     running_ = false;
+    shutdown_active_connections();
+}
+
+uint64_t Receiver::register_connection(std::shared_ptr<Connection> connection) {
+    std::lock_guard<std::mutex> lock(active_connections_mutex_);
+    const uint64_t connection_id = next_connection_id_++;
+    active_connections_.emplace(connection_id, std::move(connection));
+    return connection_id;
+}
+
+void Receiver::unregister_connection(uint64_t connection_id) {
+    std::lock_guard<std::mutex> lock(active_connections_mutex_);
+    active_connections_.erase(connection_id);
+}
+
+void Receiver::shutdown_active_connections() {
+    std::vector<std::shared_ptr<Connection>> connections;
+    {
+        std::lock_guard<std::mutex> lock(active_connections_mutex_);
+        connections.reserve(active_connections_.size());
+        for (const auto& entry : active_connections_) {
+            connections.push_back(entry.second);
+        }
+    }
+
+    for (const auto& connection : connections) {
+        connection->socket().shutdown_both();
+    }
 }
 
 std::string Receiver::pid_file_path() const {
@@ -531,12 +559,18 @@ int Receiver::handle_connection(Connection& conn) {
     return 0;
 }
 
-void Receiver::handle_connection_thread(Socket client) {
-    Connection conn(std::move(client));
-    conn.tune_socket();
+void Receiver::handle_connection_thread(std::shared_ptr<Connection> connection,
+                                        uint64_t connection_id) {
+    struct ConnectionUnregister {
+        Receiver* receiver;
+        uint64_t id;
+        ~ConnectionUnregister() { receiver->unregister_connection(id); }
+    } unregister{this, connection_id};
+
+    connection->tune_socket();
 
     try {
-        handle_connection(conn);
+        handle_connection(*connection);
     } catch (const std::exception& e) {
         LOG_ERROR("Exception in transfer thread: %s", e.what());
     }
@@ -616,12 +650,14 @@ int Receiver::run() {
         LOG_INFO("Connection from %s:%u", client.peer_address().c_str(), client.peer_port());
 
 
-        auto pending_client = std::make_shared<Socket>(std::move(client));
-        if (!thread_pool_->enqueue([this, pending_client] {
-                handle_connection_thread(std::move(*pending_client));
+        auto connection = std::make_shared<Connection>(std::move(client));
+        const uint64_t connection_id = register_connection(connection);
+
+        if (!thread_pool_->enqueue([this, connection, connection_id] {
+                handle_connection_thread(connection, connection_id);
             })) {
-            LOG_WARN("Connection queue is full; rejecting connection from %s",
-                     pending_client->peer_address().c_str());
+            LOG_WARN("Connection queue is full; rejecting incoming connection");
+            unregister_connection(connection_id);
         }
     }
 

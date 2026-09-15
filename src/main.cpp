@@ -3,6 +3,7 @@
 #include "transfer/sender.h"
 #include "transfer/receiver.h"
 #include "net/socket.h"
+#include <signal.h>
 
 #include <cstdio>
 
@@ -13,6 +14,12 @@ int main(int argc, char* argv[]) {
     if (!net_init()) {
         return 1;
     }
+
+#ifndef _WIN32
+    // Do not let sendfile() terminate sender on a disconnected receiver.
+    // It must return EPIPE so Sender can retry with --resume.
+    signal(SIGPIPE, SIG_IGN);
+#endif
 
     Args args;
     if (!parse_args(argc, argv, args)) {

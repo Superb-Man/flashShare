@@ -5,8 +5,12 @@
 #include "cli/progress.h"
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace flashshare {
 
@@ -40,7 +44,18 @@ private:
     // For recovery
     std::unique_ptr<TransferStore> transfer_store_;
 
-    void handle_connection_thread(Socket client);
+    // Accepted sockets remain here while queued or handled by a worker.
+    // stop() shuts them all down so workers blocked in recv() can exit.
+    std::mutex active_connections_mutex_;
+    std::unordered_map<uint64_t, std::shared_ptr<Connection>> active_connections_;
+    uint64_t next_connection_id_ = 1;
+
+    uint64_t register_connection(std::shared_ptr<Connection> connection);
+    void unregister_connection(uint64_t connection_id);
+    void shutdown_active_connections();
+
+    void handle_connection_thread(std::shared_ptr<Connection> connection,
+                                  uint64_t connection_id);
     int handle_connection(Connection& conn);
 
     /*

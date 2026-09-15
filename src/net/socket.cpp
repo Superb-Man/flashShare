@@ -389,7 +389,21 @@ bool Socket::set_send_timeout(int sec) {
 
 void Socket::shutdown_write() {
     if (fd_ >= 0) {
+#ifdef _WIN32
+        ::shutdown(fd_, SD_SEND);
+#else
         ::shutdown(fd_, SHUT_WR);
+#endif
+    }
+}
+
+void Socket::shutdown_both() {
+    if (fd_ >= 0) {
+#ifdef _WIN32
+        ::shutdown(fd_, SD_BOTH);
+#else
+        ::shutdown(fd_, SHUT_RDWR);
+#endif
     }
 }
 

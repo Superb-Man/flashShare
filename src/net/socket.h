@@ -96,6 +96,9 @@ public:
 
     // Shutdown
     void shutdown_write();
+
+    // wake a worker blocked in recv()/sendfile() before its owner destroys it.
+    void shutdown_both();
     void close();
 
 private:
