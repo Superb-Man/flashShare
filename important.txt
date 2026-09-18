@@ -1,0 +1,4 @@
+docker compose -f docker-compose.multi.yml up --no-deps receiver
+docker compose -f docker-compose.multi.yml up --no-deps sender1
+docker compose -f docker-compose.multi.yml up --no-deps sender2
+docker compose -f docker-compose.multi.yml up --no-deps sender3

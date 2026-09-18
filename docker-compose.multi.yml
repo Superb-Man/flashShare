@@ -1,0 +1,39 @@
+services:
+  receiver:
+    build: { context: ., dockerfile: Dockerfile.flashshare }
+    container_name: fs-receiver
+    networks:
+      fsnet:
+        ipv4_address: 172.30.117.10
+    volumes: ["recv-out:/data/out"]
+    command: ["recv", "--port", "5117", "--out", "/data/out", "--accept-all", "--verbose"]
+
+  sender1:
+    build: { context: ., dockerfile: Dockerfile.flashshare }
+    networks: [fsnet]
+    depends_on: [receiver]
+    volumes: ["./testfiles/a.bin:/data/a.bin:ro"]
+    command: ["send", "/data/a.bin", "--to", "172.30.117.10", "--port", "5117", "--resume"]
+
+  sender2:
+    build: { context: ., dockerfile: Dockerfile.flashshare }
+    networks: [fsnet]
+    depends_on: [receiver]
+    volumes: ["./testfiles/b.bin:/data/b.bin:ro"]
+    command: ["send", "/data/b.bin", "--to", "172.30.117.10", "--port", "5117", "--resume"]
+
+  sender3:
+    build: { context: ., dockerfile: Dockerfile.flashshare }
+    networks: [fsnet]
+    depends_on: [receiver]
+    volumes: ["./testfiles/c.bin:/data/c.bin:ro"]
+    command: ["send", "/data/c.bin", "--to", "172.30.117.10", "--port", "5117", "--resume"]
+
+networks:
+  fsnet:
+    ipam:
+      config:
+        - subnet: 172.30.117.0/24
+
+volumes:
+  recv-out:
