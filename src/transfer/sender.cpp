@@ -151,7 +151,12 @@ bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_in
             ssize_t n = conn.socket().sendfile(file_fd, &source_offset, to_send);
 
             if (n < 0) {
-                if (errno == EINTR || errno == EAGAIN) continue;
+                if (errno == EINTR) continue;
+
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    LOG_ERROR("Socket send time out while sending %s", file.relpath.c_str());
+                    return false;
+                }
 
                 LOG_ERROR("sendfile failed for %s: %s", file.relpath.c_str(), strerror(errno));
                 return false;
@@ -256,6 +261,11 @@ bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_p
         return false;
     }
 
+    constexpr int SEND_TIMEOUT_SECONDS = 15;
+    if (!socket.set_send_timeout(SEND_TIMEOUT_SECONDS)) {
+            LOG_ERROR("Cannot set send timeout for %s:%u: %s", target_ip_.c_str(), port_, strerror(errno));
+        return false;
+    }
     socket.set_nodelay(true);
     socket.set_cork(true);
 

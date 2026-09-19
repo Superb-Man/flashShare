@@ -32,6 +32,8 @@ add_executable(flashshare
     src/util/logger.cpp
     src/util/sha256.cpp
     src/util/fs.cpp
+    src/transfer/prepared_manifest.cpp
+    src/transfer/fanout_sender.cpp
 )
 
 target_include_directories(flashshare PRIVATE src)
