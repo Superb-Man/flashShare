@@ -3,17 +3,68 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <unordered_set>
+#include <utility>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#endif
 
 namespace flashshare {
 
 static const char* VERSION_STR = "flashshare 1.0.0";
+
+static bool parse_targets(const std::string& value, std::vector<std::string>& targets) {
+    targets.clear();
+    std::vector<std::string> parsed;
+    std::unordered_set<std::string> seen;
+    size_t start = 0;
+
+    for (;;) {
+        size_t comma = value.find(',', start);
+        std::string target = value.substr(start, comma == std::string::npos ? comma : comma - start);
+
+        // Allow spaces around an address, but not empty list entries.
+        size_t first = target.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            fprintf(stderr, "Error: --to contains an empty receiver address\n");
+            return false;
+        }
+        size_t last = target.find_last_not_of(" \t\r\n");
+        target = target.substr(first, last - first + 1);
+
+        // Match the IPv4 addresses supported by Socket::connect().
+        struct in_addr address{};
+        if (inet_pton(AF_INET, target.c_str(), &address) != 1) {
+            fprintf(stderr, "Error: invalid receiver IPv4 address: %s\n", target.c_str());
+            return false;
+        }
+
+        if (!seen.insert(target).second) {
+            fprintf(stderr, "Error: duplicate receiver address: %s\n", target.c_str());
+            return false;
+        }
+        parsed.push_back(std::move(target));
+
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+
+    targets = std::move(parsed);
+    return true;
+}
 
 static void print_help() {
     printf(
         "FlashShare — High-speed LAN file transfer\n"
         "\n"
         "USAGE:\n"
-        "  flashshare send <path> [<path>...] --to <ip> [options]   Send files to a peer\n"
+        "  flashshare send <path> [<path>...] --to <ip[,ip...]> [options]\n"
         "  flashshare recv [options]                      Receive files from a peer\n"
         "\n"
         "COMMANDS:\n"
@@ -23,7 +74,7 @@ static void print_help() {
         "  version         Show version\n"
         "\n"
         "OPTIONS:\n"
-        "  --to <ip>       Target peer IP address (for send)\n"
+        "  --to <ip[,ip...]>  Receiver IPv4 addresses, separated by commas\n"
         "  --port <n>      Port number (default: 5117)\n"
         "  --out <dir>     Output directory (default: current dir)\n"
         "  --encrypt       Enable AES-256-GCM encryption\n"
@@ -38,6 +89,7 @@ static void print_help() {
         "\n"
         "EXAMPLES:\n"
         "  flashshare send bigfile.iso --to 192.168.1.50\n"
+        "  flashshare send bigfile.iso --to 192.168.1.50,192.168.1.51 --resume\n"
         "  flashshare send ./project/ --to 192.168.1.50 --encrypt\n"
         "  flashshare send a.txt b.txt ./project/ --to 192.168.1.50\n"
         "  flashshare recv --port 5117 --out ~/downloads\n"
@@ -87,7 +139,11 @@ bool parse_args(int argc, char* argv[], Args& args) {
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
 
-        if (arg == "--to" && i + 1 < argc) {
+        if (arg == "--to") {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --to requires a receiver address or address list\n");
+                return false;
+            }
             args.to = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
             args.port = static_cast<uint16_t>(atoi(argv[++i]));
@@ -128,10 +184,15 @@ bool parse_args(int argc, char* argv[], Args& args) {
         return false;
     }
 
-    if (args.command == Command::SEND && args.to.empty()) {
-        fprintf(stderr, "Error: send requires --to <ip>\n");
-        print_help();
-        return false;
+    if (args.command == Command::SEND) {
+        if (args.to.empty()) {
+            fprintf(stderr, "Error: send requires --to <ip[,ip...]>\n");
+            print_help();
+            return false;
+        }
+        if (!parse_targets(args.to, args.targets)) {
+            return false;
+        }
     }
 
     return true;

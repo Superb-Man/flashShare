@@ -1,6 +1,7 @@
 #include "cli/args.h"
 #include "util/logger.h"
 #include "transfer/sender.h"
+#include "transfer/fanout_sender.h"
 #include "transfer/receiver.h"
 #include "net/socket.h"
 #include <signal.h>
@@ -43,7 +44,29 @@ int main(int argc, char* argv[]) {
             return 0;
 
         case Command::SEND: {
-            Sender sender(args.paths, args.to, args.port, args.encrypt, args.resume);
+            if (args.targets.empty()) {
+                LOG_ERROR("No receiver addresses provided");
+                return 1;
+            }
+
+            if (args.targets.size() == 1) {
+                Sender sender(
+                    args.paths,
+                    args.targets.front(),
+                    args.port,
+                    args.encrypt,
+                    args.resume);
+
+                return sender.run();
+            }
+
+            FanoutSender sender(
+                args.paths,
+                args.targets,
+                args.port,
+                args.encrypt,
+                args.resume);
+
             return sender.run();
         }
 

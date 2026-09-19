@@ -18,6 +18,7 @@ struct Args {
     Command command = Command::NONE;
     std::vector<std::string> paths; // files/dirs to send (one or more)
     std::string to;                // target peer IP or hostname
+    std::vector<std::string> targets; // list of target peers IPs or hostnames
     uint16_t port = 5117;          // port
     std::string out_dir = ".";     // output directory for receive
     bool encrypt = false;          // enable encryption

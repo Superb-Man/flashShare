@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include "transfer/prepared_manifest.h"
 
 namespace flashshare {
 
@@ -16,14 +17,39 @@ public:
     Sender(const std::vector<std::string>& paths, const std::string& target_ip,
            uint16_t port, bool encrypt, bool resume);
 
+    // Fanout multiple connections for parallel file transfer
+    Sender(std::shared_ptr<const PreparedManifest> manifest,
+           const std::string& target_ip,
+           uint16_t port,
+           bool encrypt,
+           bool resume,
+           bool show_progress = false);
+
     // Run the send operation
     int run();
 
+    const std::string& transfer_id() const {
+        return session_.transfer_id;
+    }
+    const std::string& last_error() const {
+        return last_error_;
+    }
+    size_t retry_count() const {
+        return retry_count_;
+    }
+    std::uint64_t bytes_sent() const {
+        return bytes_sent_;
+    }
+    double elapsed_time() const {
+        return elapsed_time_;
+    }
+
 private:
     struct TransferSession {
-        std::string transfer_id;
-        std::vector<FileEntry> files;
-        uint64_t total_size = 0;
+        std::string transfer_id; // remains unchanged for reconnect attempts
+        // std::vector<FileEntry> files;
+        // uint64_t total_size = 0;
+        std::shared_ptr<const PreparedManifest> manifest; // shared read only metadata for the transfer
     };
 
     std::vector<std::string> paths_;
@@ -31,10 +57,17 @@ private:
     uint16_t port_;
     bool encrypt_;
     bool resume_;
+    bool show_progress_ = true;
 
-    std::string generate_transfer_id();
-    static uint64_t get_file_size(const std::string& path);
-    static std::string basename(const std::string& path);
+    TransferSession session_;
+    std::string last_error_;
+    size_t retry_count_ = 0;
+    std::uint64_t bytes_sent_ = 0;
+    double elapsed_time_ = 0.0;
+
+    // std::string generate_transfer_id();
+    // static uint64_t get_file_size(const std::string& path);
+    // static std::string basename(const std::string& path);
 
     // Builds the file manifest by walking every given path: a single entry
     // for a regular file, or the full recursive listing (with directory
@@ -52,7 +85,7 @@ private:
                    const FileEntry& file,
                    uint32_t file_index,
                    uint64_t receiver_confirmed_offset,
-                   ProgressBar& progress);
+                   ProgressBar* progress);
 
     /*
      * Creates a new TCP connection, resends the same transfer ID and manifest,

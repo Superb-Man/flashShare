@@ -1,24 +1,22 @@
 #include "transfer/sender.h"
 #include "util/logger.h"
-#include "util/fs.h"
-#include "util/sha256.h"
-
-#include <sys/stat.h>
 #include <fcntl.h>
+#include <cerrno>
 #include <cstring>
 #include <cstdio>
 #include <random>
 #include <sstream>
 #include <iomanip>
 #include <chrono>
-#include <unordered_set>
 #include <cstdlib>
+#include <exception>
+#include <memory>
+#include <stdexcept>
 #include <thread>
+#include <utility>
 
 #ifdef _WIN32
 #include <io.h>
-#define S_ISREG(m) (((m) & 0170000) == 0100000)
-#define S_ISDIR(m) (((m) & 0170000) == 0040000)
 #else
 #include <unistd.h>
 #endif
@@ -26,6 +24,34 @@
 namespace flashshare {
 
 namespace {
+
+std::string make_transfer_id() {
+    std::random_device rd;
+    std::mt19937_64 generator(rd());
+    std::uniform_int_distribution<uint64_t> distribution;
+
+    std::ostringstream result;
+    result << std::hex << std::setfill('0');
+    result << std::setw(16) << distribution(generator);
+    result << std::setw(16) << distribution(generator);
+    return result.str();
+}
+
+class ScopedFile {
+private:
+    int fd_ = -1;
+public:
+    explicit ScopedFile(int fd) : fd_(fd) {}
+    ~ScopedFile() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+
+    ScopedFile(const ScopedFile&) = delete;
+    ScopedFile& operator=(const ScopedFile&) = delete;
+    int get() const { return fd_; }
+};
 
 // Test-only hook. It has no effect unless the test explicitly sets:
 //   FLASHSHARE_TEST_SEND_DELAY_US=<microseconds>
@@ -55,30 +81,15 @@ Sender::Sender(const std::vector<std::string>& paths, const std::string& target_
     : paths_(paths), target_ip_(target_ip), port_(port),
       encrypt_(encrypt), resume_(resume) {}
 
-std::string Sender::generate_transfer_id() {
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    std::uniform_int_distribution<uint64_t> dis;
-
-    std::ostringstream ss;
-    ss << std::hex << std::setfill('0');
-    ss << std::setw(16) << dis(gen);
-    ss << std::setw(16) << dis(gen);
-    return ss.str();
-}
-
-uint64_t Sender::get_file_size(const std::string& path) {
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0) {
-        return 0;
-    }
-    return static_cast<uint64_t>(st.st_size);
-}
-
-std::string Sender::basename(const std::string& path) {
-    size_t pos = path.find_last_of('/');
-    if (pos == std::string::npos) return path;
-    return path.substr(pos + 1);
+Sender::Sender(std::shared_ptr<const PreparedManifest> manifest,
+               const std::string& target_ip,
+               uint16_t port,
+               bool encrypt,
+               bool resume,
+               bool show_progress)
+    : target_ip_(target_ip), port_(port),
+      encrypt_(encrypt), resume_(resume), show_progress_(show_progress) {
+    session_.manifest = std::move(manifest);
 }
 
 // Sends one file from the exact durable byte offset confirmed by the receiver.
@@ -86,7 +97,7 @@ std::string Sender::basename(const std::string& path) {
 // The sender never assumes that a successful sendfile()/send() call means the
 // receiver stored those bytes. After a broken connection, it reconnects and
 // uses a new receiver-confirmed offset before sending again.
-bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_index, uint64_t receiver_confirmed_offset, ProgressBar& progress) {
+bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_index, uint64_t receiver_confirmed_offset, ProgressBar* progress) {
     if (receiver_confirmed_offset > file.size) {
         LOG_ERROR("Receiver returned invalid offset for %s: %llu > %llu",
                   file.relpath.c_str(),
@@ -101,7 +112,9 @@ bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_in
     }
 
     uint64_t sent = receiver_confirmed_offset;
-    progress.update(sent);
+    if (progress) {
+        progress->update(sent);
+    }
 
     // The receiver already finalized this file during an earlier connection.
     // It still expects FILE_COMPLETE so it can keep the connection protocol
@@ -116,6 +129,7 @@ bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_in
                   file.abspath.c_str(), strerror(errno));
         return false;
     }
+    ScopedFile source_guard(file_fd);
 
     if (!encrypt_) {
         LOG_INFO("Resuming %s at %llu/%llu via zero-copy sendfile",
@@ -140,19 +154,21 @@ bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_in
                 if (errno == EINTR || errno == EAGAIN) continue;
 
                 LOG_ERROR("sendfile failed for %s: %s", file.relpath.c_str(), strerror(errno));
-                ::close(file_fd);
                 return false;
             }
 
             if (n == 0) {
                 LOG_ERROR("Source file changed or ended early: %s",
                           file.abspath.c_str());
-                ::close(file_fd);
                 return false;
             }
 
-            sent += static_cast<uint64_t>(n);
-            progress.update(sent);
+            uint64_t new_sent = static_cast<uint64_t>(n);
+            sent += new_sent;
+            bytes_sent_ += new_sent;
+            if (progress) {
+                progress->update(sent);
+            }
             maybe_test_send_delay(); // For test purpose
 
         }
@@ -161,13 +177,11 @@ bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_in
         // checkpoints encrypted transfers after each complete chunk.
         if (receiver_confirmed_offset % CHUNK_SIZE != 0) {
             LOG_ERROR("Encrypted resume offset is not chunk-aligned");
-            ::close(file_fd);
             return false;
         }
 
         if (lseek(file_fd, static_cast<off_t>(receiver_confirmed_offset), SEEK_SET) < 0) {
             LOG_ERROR("Cannot seek source file %s: %s", file.abspath.c_str(), strerror(errno));
-            ::close(file_fd);
             return false;
         }
 
@@ -186,29 +200,28 @@ bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_in
                 if (errno == EINTR) continue;
 
                 LOG_ERROR("read failed for %s: %s", file.abspath.c_str(), strerror(errno));
-                ::close(file_fd);
                 return false;
             }
 
             if (n == 0) {
                 LOG_ERROR("Source file changed or ended early: %s",
                           file.abspath.c_str());
-                ::close(file_fd);
                 return false;
             }
 
             if (!conn.send_data_chunk( buffer.data(), static_cast<size_t>(n), sequence++)) {
                 LOG_ERROR("Failed to send data chunk for %s", file.relpath.c_str());
-                ::close(file_fd);
                 return false;
             }
 
-            sent += static_cast<uint64_t>(n);
-            progress.update(sent);
+            uint64_t new_sent = static_cast<uint64_t>(n);
+            sent += new_sent;
+            bytes_sent_ += new_sent;
+            if (progress) {
+                progress->update(sent);
+            }
         }
     }
-
-    ::close(file_fd);
 
     conn.socket().set_cork(false);
     conn.socket().set_cork(true);
@@ -221,42 +234,6 @@ bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_in
     return true;
 }
 
-std::vector<FileEntry> Sender::build_manifest() {
-    std::vector<FileEntry> files;
-
-    for (const auto& path : paths_) {
-        if (fs_is_directory(path)) {
-            LOG_DEBUG("Walking directory: %s", path.c_str());
-            auto dir_files = fs_walk_directory(path);
-            files.insert(files.end(), dir_files.begin(), dir_files.end());
-        } else {
-            FileEntry entry;
-            entry.relpath = basename(path);
-            entry.abspath = path;
-            entry.size = get_file_size(path);
-            files.push_back(std::move(entry));
-        }
-    }
-
-    // Multiple source paths can legitimately produce the same relpath (e.g.
-    // two single files with the same basename) — warn since the receiver
-    // will silently overwrite one with the other.
-    std::unordered_set<std::string> seen;
-    for (const auto& entry : files) {
-        if (!seen.insert(entry.relpath).second) {
-            LOG_WARN("Duplicate path in manifest: %s (later file will overwrite it on the receiver)",
-                     entry.relpath.c_str());
-        }
-    }
-
-    for (auto& entry : files) {
-        entry.sha256 = SHA256::file_hash(entry.abspath);
-        LOG_DEBUG("Hashed %s -> %s", entry.relpath.c_str(), entry.sha256.c_str());
-    }
-
-    return files;
-}
-
 // Opens a new TCP connection and asks the receiver for its durable offsets.
 // The same TransferSession is used for every retry, including its transfer ID
 // and original manifest, so the receiver can find the correct recovery journal.
@@ -264,7 +241,9 @@ bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_p
     conn.reset();
     resume_offsets.clear();
 
+    const PreparedManifest& manifest = *session.manifest;
     Socket socket;
+
     if (!socket.create()) {
         return false;
     }
@@ -285,8 +264,8 @@ bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_p
     TransferRequest request;
     request.version = PROTOCOL_VERSION;
     request.transfer_id = session.transfer_id;
-    request.files = session.files;
-    request.total_size = session.total_size;
+    request.files = manifest.files;
+    request.total_size = manifest.total_size;
     request.encrypted = encrypt_;
     request.resume = resume_;
 
@@ -302,18 +281,21 @@ bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_p
     }
 
     if (!response.accepted) {
+        last_error_ = response.message.empty()
+            ? "Transfer rejected by receiver"
+            : "Transfer rejected: " + response.message;
         LOG_ERROR("Transfer rejected by receiver: %s",response.message.empty() ? "no reason supplied" : response.message.c_str());
         return false;
     }
 
-    if (response.resume_offsets.size() != session.files.size()) {
-        LOG_ERROR("Receiver returned %zu offsets for %zu files", response.resume_offsets.size(), session.files.size());
+    if (response.resume_offsets.size() != manifest.files.size()) {
+        LOG_ERROR("Receiver returned %zu offsets for %zu files", response.resume_offsets.size(), manifest.files.size());
         return false;
     }
 
-    for (size_t i = 0; i < session.files.size(); ++i) {
-        if (response.resume_offsets[i] > session.files[i].size) {
-            LOG_ERROR("Receiver returned invalid offset for %s", session.files[i].relpath.c_str());
+    for (size_t i = 0; i < manifest.files.size(); ++i) {
+        if (response.resume_offsets[i] > manifest.files[i].size) {
+            LOG_ERROR("Receiver returned invalid offset for %s", manifest.files[i].relpath.c_str());
             return false;
         }
     }
@@ -337,7 +319,8 @@ bool Sender::wait_before_retry(unsigned int failed_attempt) const {
         seconds = 10;
     }
 
-    LOG_WARN("Connection interrupted; retrying in %u second(s)", seconds);
+    LOG_WARN("[%s:%u] Connection interrupted; retrying in %u second(s)",
+             target_ip_.c_str(), port_, seconds);
     std::this_thread::sleep_for(std::chrono::seconds(seconds));
     return true;
 }
@@ -350,7 +333,8 @@ bool Sender::wait_before_retry(unsigned int failed_attempt) const {
 bool Sender::send_attempt(const TransferSession& session,
                           Connection& conn,
                           const std::vector<uint64_t>& resume_offsets) {
-    if (resume_offsets.size() != session.files.size()) {
+    const auto& files = session.manifest->files;
+    if (resume_offsets.size() != files.size()) {
         LOG_ERROR("Invalid resume-offset count");
         return false;
     }
@@ -358,30 +342,36 @@ bool Sender::send_attempt(const TransferSession& session,
     const auto overall_start = std::chrono::steady_clock::now();
     uint64_t bytes_sent_this_attempt = 0;
 
-    for (size_t i = 0; i < session.files.size(); ++i) {
-        const FileEntry& file = session.files[i];
+    for (size_t i = 0; i < files.size(); ++i) {
+        const FileEntry& file = files[i];
         const uint64_t offset = resume_offsets[i];
 
-        LOG_INFO("[%zu/%zu] Sending %s from %llu/%llu",
+        LOG_INFO("[%s:%u] [%zu/%zu] Sending %s from %llu/%llu",
+                 target_ip_.c_str(), port_,
                  i + 1,
-                 session.files.size(),
+                 files.size(),
                  file.relpath.c_str(),
                  static_cast<unsigned long long>(offset),
                  static_cast<unsigned long long>(file.size));
 
-        ProgressBar progress(file.relpath, file.size);
+        std::unique_ptr<ProgressBar> progress;
+        if (show_progress_) {
+            progress = std::make_unique<ProgressBar>(file.relpath, file.size);
+        }
 
         if (!send_file(conn,
                        file,
                        static_cast<uint32_t>(i),
                        offset,
-                       progress)) {
+                       progress.get())) {
             LOG_ERROR("Transfer attempt failed while sending %s",
                       file.relpath.c_str());
             return false;
         }
 
-        progress.finish();
+        if (progress) {
+            progress->finish();
+        }
         bytes_sent_this_attempt += file.size - offset;
     }
 
@@ -400,76 +390,91 @@ bool Sender::send_attempt(const TransferSession& session,
 }
 
 int Sender::run() {
-    if (paths_.empty()) {
-        LOG_ERROR("No paths to send");
-        return 1;
+    const auto started = std::chrono::steady_clock::now();
+    last_error_.clear();
+    retry_count_ = 0;
+    bytes_sent_ = 0;
+    elapsed_time_ = 0.0;
+    session_.transfer_id.clear();
+
+    auto finish = [&](int exit_code) {
+        elapsed_time_ = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        return exit_code;
+    };
+
+    try {
+        // Direct transfers prepare their metadata here. Fan-out workers
+        // reuse the immutable manifest supplied by their coordinator.
+        if (!paths_.empty() || !session_.manifest) {
+            session_.manifest = flashshare::prepare_manifest(paths_);
+        }
+
+        if (session_.manifest->files.empty()) {
+            throw std::runtime_error("No files found in source paths");
+        }
+
+        // One destination's identity stays stable throughout all retries.
+        session_.transfer_id = make_transfer_id();
+        LOG_INFO("[%s:%u] Prepared transfer %s: %zu file(s), %llu bytes",
+                 target_ip_.c_str(), port_, session_.transfer_id.c_str(),
+                 session_.manifest->files.size(),
+                 static_cast<unsigned long long>(session_.manifest->total_size));
+
+        // Preserve the original limit of ten total attempts with --resume.
+        constexpr unsigned int MAX_ATTEMPTS = 10;
+        unsigned int failed_attempts = 0;
+
+        for (;;) {
+            last_error_.clear();
+            std::unique_ptr<Connection> conn;
+            std::vector<uint64_t> resume_offsets;
+
+            const bool connected = connect_and_negotiate(session_, conn, resume_offsets);
+            const bool transferred = connected && send_attempt(session_, *conn, resume_offsets);
+
+            // Close the failed connection before waiting to reconnect.
+            conn.reset();
+
+            if (transferred) {
+                LOG_INFO("[%s:%u] Finished sending transfer %s",
+                         target_ip_.c_str(), port_, session_.transfer_id.c_str());
+                return finish(0);
+            }
+
+            if (last_error_.empty()) {
+                last_error_ = connected
+                    ? "File transmission failed"
+                    : "Connection or transfer negotiation failed";
+            }
+
+            ++failed_attempts;
+            if (!resume_) {
+                LOG_ERROR("[%s:%u] %s; automatic resume is disabled",
+                          target_ip_.c_str(), port_, last_error_.c_str());
+                return finish(1);
+            }
+
+            if (failed_attempts >= MAX_ATTEMPTS) {
+                LOG_ERROR("[%s:%u] Failed after %u attempts: %s",
+                          target_ip_.c_str(), port_, failed_attempts, last_error_.c_str());
+                return finish(1);
+            }
+
+            if (!wait_before_retry(failed_attempts)) {
+                last_error_ = "Retry interrupted";
+                return finish(1);
+            }
+            ++retry_count_;
+        }
+    } catch (const std::exception& error) {
+        last_error_ = error.what();
+    } catch (...) {
+        last_error_ = "Unexpected sender failure";
     }
 
-    // Check every path exists and is a file or directory before doing
-    // anything else, so a bad path fails fast instead of mid-transfer.
-    for (const auto& path : paths_) {
-        struct stat st;
-        if (stat(path.c_str(), &st) != 0) {
-            LOG_ERROR("Cannot access path: %s — %s", path.c_str(), strerror(errno));
-            return 1;
-        }
-        if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) {
-            LOG_ERROR("Not a regular file or directory: %s", path.c_str());
-            return 1;
-        }
-    }
-
-    TransferSession session;
-    session.transfer_id = generate_transfer_id();
-    session.files = build_manifest();
-
-    if (session.files.empty()) {
-        LOG_ERROR("No files found in given paths");
-        return 1;
-    }
-
-    uint64_t total_size = 0;
-    for (const auto& f : session.files) total_size += f.size;
-
-    LOG_INFO("Prepared transfer %s: %zu file(s), %llu byte(s)",
-             session.transfer_id.c_str(),
-             session.files.size(),
-             static_cast<unsigned long long>(session.total_size));
-
-    // Without --resume, preserve the existing one-attempt behavior.
-    // With --resume, every reconnect uses this same session and transfer ID.
-
-    constexpr unsigned int MAX_RESUME_RETRIES = 10;
-    unsigned int failed_attempts = 0;
-
-    for (;;) {
-        std::unique_ptr<Connection> conn;
-        std::vector<uint64_t> resume_offsets;
-
-        const bool connected = connect_and_negotiate(session, conn, resume_offsets);
-
-        const bool transferred = connected && send_attempt(session, *conn, resume_offsets);
-
-        if (transferred) {
-            LOG_INFO("Transfer complete: %s", session.transfer_id.c_str());
-            return 0;
-        }
-
-        if (!resume_) {
-            LOG_ERROR("Transfer failed. Re-run with --resume to enable recovery.");
-            return 1;
-        }
-
-        ++failed_attempts;
-        if (failed_attempts >= MAX_RESUME_RETRIES) {
-            LOG_ERROR("Transfer %s could not recover after %u attempts", session.transfer_id.c_str(), failed_attempts);
-            return 1;
-        }
-
-        if (!wait_before_retry(failed_attempts)) {
-            return 1;
-        }
-    }
+    LOG_ERROR("[%s:%u] %s", target_ip_.c_str(), port_, last_error_.c_str());
+    return finish(1);
 }
 
 }
