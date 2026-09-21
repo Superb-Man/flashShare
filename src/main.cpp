@@ -65,7 +65,8 @@ int main(int argc, char* argv[]) {
                 args.targets,
                 args.port,
                 args.encrypt,
-                args.resume);
+                args.resume
+            );
 
             return sender.run();
         }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <string>
 #include <cstdint>
 
@@ -57,6 +58,7 @@ public:
 
     // Connect to remote address:port
     bool connect(const std::string& address, uint16_t port, int timeout_sec = 10);
+    bool relay_connect(const std::string& address, uint16_t port, std::chrono::milliseconds timeout);
 
     // Set socket buffer sizes (SO_SNDBUF / SO_RCVBUF)
     bool set_buffer_size(int send_buf, int recv_buf);
@@ -90,9 +92,11 @@ public:
 
     // Set receive timeout
     bool set_recv_timeout(int sec);
+    bool relay_set_recv_timeout(std::chrono::milliseconds timeout);
 
     // Set send timeout
     bool set_send_timeout(int sec);
+    bool relay_set_send_timeout(std::chrono::milliseconds timeout);
 
     // Shutdown
     void shutdown_write();

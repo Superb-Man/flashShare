@@ -4,6 +4,11 @@
 #include <cerrno>
 #include <cstring>
 
+/**
+ * Credit - Cline
+ * 
+ */
+
 #ifdef _WIN32
 // Winsock2 path
 #include <io.h>
@@ -135,6 +140,17 @@ Socket Socket::accept() {
 }
 
 bool Socket::connect(const std::string& address, uint16_t port, int timeout_sec) {
+    return relay_connect(address, port, std::chrono::seconds(timeout_sec));
+}
+
+bool Socket::relay_connect(const std::string& address, uint16_t port,
+                           std::chrono::milliseconds timeout) {
+    const auto timeout_ms = timeout.count();
+    if (timeout_ms <= 0) {
+        LOG_ERROR("connect() deadline expired");
+        return false;
+    }
+
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -182,8 +198,8 @@ bool Socket::connect(const std::string& address, uint16_t port, int timeout_sec)
     FD_SET(fd_, &write_fds);
 
     struct timeval tv;
-    tv.tv_sec = timeout_sec;
-    tv.tv_usec = 0;
+    tv.tv_sec = static_cast<long>(timeout_ms / 1000);
+    tv.tv_usec = static_cast<long>((timeout_ms % 1000) * 1000);
 
     ret = ::select(fd_ + 1, nullptr, &write_fds, nullptr, &tv);
     if (ret <= 0) {
@@ -374,17 +390,47 @@ ssize_t Socket::sendfile(int file_fd, off_t* offset, size_t count) {
 }
 
 bool Socket::set_recv_timeout(int sec) {
+    return relay_set_recv_timeout(std::chrono::seconds(sec));
+}
+
+bool Socket::relay_set_recv_timeout(std::chrono::milliseconds timeout) {
+    const auto timeout_ms = timeout.count();
+    if (timeout_ms <= 0) {
+        return false;
+    }
+
+#ifdef _WIN32
+    DWORD value = static_cast<DWORD>(timeout_ms);
+    return setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO,
+                      reinterpret_cast<const char*>(&value), sizeof(value)) == 0;
+#else
     struct timeval tv;
-    tv.tv_sec = sec;
-    tv.tv_usec = 0;
+    tv.tv_sec = static_cast<long>(timeout_ms / 1000);
+    tv.tv_usec = static_cast<long>((timeout_ms % 1000) * 1000);
     return setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv)) == 0;
+#endif
 }
 
 bool Socket::set_send_timeout(int sec) {
+    return relay_set_send_timeout(std::chrono::seconds(sec));
+}
+
+bool Socket::relay_set_send_timeout(std::chrono::milliseconds timeout) {
+    const auto timeout_ms = timeout.count();
+    if (timeout_ms <= 0) {
+        return false;
+    }
+
+#ifdef _WIN32
+    DWORD value = static_cast<DWORD>(timeout_ms);
+    return setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO,
+                      reinterpret_cast<const char*>(&value), sizeof(value)) == 0;
+#else
     struct timeval tv;
-    tv.tv_sec = sec;
-    tv.tv_usec = 0;
+    tv.tv_sec = static_cast<long>(timeout_ms / 1000);
+    tv.tv_usec = static_cast<long>((timeout_ms % 1000) * 1000);
     return setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv)) == 0;
+#endif
 }
 
 void Socket::shutdown_write() {
