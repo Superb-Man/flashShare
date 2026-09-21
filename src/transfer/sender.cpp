@@ -1,4 +1,5 @@
 #include "transfer/sender.h"
+#include "transfer/scoped_file.h"
 #include "util/logger.h"
 #include <fcntl.h>
 #include <cerrno>
@@ -36,22 +37,6 @@ std::string make_transfer_id() {
     result << std::setw(16) << distribution(generator);
     return result.str();
 }
-
-class ScopedFile {
-private:
-    int fd_ = -1;
-public:
-    explicit ScopedFile(int fd) : fd_(fd) {}
-    ~ScopedFile() {
-        if (fd_ >= 0) {
-            ::close(fd_);
-        }
-    }
-
-    ScopedFile(const ScopedFile&) = delete;
-    ScopedFile& operator=(const ScopedFile&) = delete;
-    int get() const { return fd_; }
-};
 
 // Test-only hook. It has no effect unless the test explicitly sets:
 //   FLASHSHARE_TEST_SEND_DELAY_US=<microseconds>

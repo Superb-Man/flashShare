@@ -432,8 +432,7 @@ int Receiver::handle_connection(Connection& conn) {
         return 1;
     }
 
-    auto stored_transfer =
-        transfer_store_->open_or_create(sender_public_ip, req);
+    auto stored_transfer = transfer_store_->open_or_create(sender_public_ip, req);
 
     if (!stored_transfer) {
         return reject("cannot create or validate transfer recovery state");
@@ -460,8 +459,7 @@ int Receiver::handle_connection(Connection& conn) {
 
     TransferResponse response;
     response.accepted = true;
-    response.resume_offsets =
-        transfer_store_->resume_offsets(*stored_transfer);
+    response.resume_offsets = transfer_store_->resume_offsets(*stored_transfer);
 
     if (!conn.send_transfer_response(response)) {
         LOG_ERROR("Failed to send transfer response");
