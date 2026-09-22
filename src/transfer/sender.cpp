@@ -71,9 +71,11 @@ Sender::Sender(std::shared_ptr<const PreparedManifest> manifest,
                uint16_t port,
                bool encrypt,
                bool resume,
-               bool show_progress)
+               bool show_progress,
+               std::string transfer_id)
     : target_ip_(target_ip), port_(port),
-      encrypt_(encrypt), resume_(resume), show_progress_(show_progress) {
+      encrypt_(encrypt), resume_(resume), show_progress_(show_progress),
+      requested_transfer_id_(std::move(transfer_id)) {
     session_.manifest = std::move(manifest);
 }
 
@@ -390,7 +392,6 @@ int Sender::run() {
     retry_count_ = 0;
     bytes_sent_ = 0;
     elapsed_time_ = 0.0;
-    session_.transfer_id.clear();
 
     auto finish = [&](int exit_code) {
         elapsed_time_ = std::chrono::duration<double>(
@@ -410,7 +411,10 @@ int Sender::run() {
         }
 
         // One destination's identity stays stable throughout all retries.
-        session_.transfer_id = make_transfer_id();
+        // Relay mode supplies the ID already distributed to its receivers.
+        session_.transfer_id = requested_transfer_id_.empty()
+            ? make_transfer_id()
+            : requested_transfer_id_;
         LOG_INFO("[%s:%u] Prepared transfer %s: %zu file(s), %llu bytes",
                  target_ip_.c_str(), port_, session_.transfer_id.c_str(),
                  session_.manifest->files.size(),

@@ -23,7 +23,8 @@ public:
            uint16_t port,
            bool encrypt,
            bool resume,
-           bool show_progress = false);
+           bool show_progress = false,
+           std::string transfer_id = "");
 
     // Run the send operation
     int run();
@@ -58,6 +59,7 @@ private:
     bool encrypt_;
     bool resume_;
     bool show_progress_ = true;
+    std::string requested_transfer_id_;
 
     TransferSession session_;
     std::string last_error_;

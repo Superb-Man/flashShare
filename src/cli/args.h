@@ -10,6 +10,7 @@ enum class Command {
     NONE,
     SEND,
     RECV,
+    RELAY,
     HELP,
     VERSION
 };
@@ -20,6 +21,8 @@ struct Args {
     std::string to;                // target peer IP or hostname
     std::vector<std::string> targets; // list of target peers IPs or hostnames
     uint16_t port = 5117;          // port
+    std::string next_host;         // next relay host
+    uint16_t next_port = 5117;     // next relay port
     std::string out_dir = ".";     // output directory for receive
     bool encrypt = false;          // enable encryption
     bool resume = false;           // resume interrupted transfer

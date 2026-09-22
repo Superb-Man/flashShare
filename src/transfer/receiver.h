@@ -1,6 +1,7 @@
 #pragma once
 
 #include "net/connection.h"
+#include "net/relay_connection.h"
 #include "net/threadpool.h"
 #include "cli/progress.h"
 
@@ -50,6 +51,19 @@ private:
     std::unordered_map<uint64_t, std::shared_ptr<Connection>> active_connections_;
     uint64_t next_connection_id_ = 1;
 
+    struct RelayAssignment {
+        std::string coordinator_ip;
+        std::string discovery_id;
+        uint64_t total_size = 0;
+        uint32_t file_count = 0;
+        bool has_downstream = false;
+        std::string downstream_address;
+        uint16_t downstream_port = DEFAULT_PORT;
+    };
+
+    std::mutex relay_assignments_mutex_;
+    std::unordered_map<std::string, RelayAssignment> relay_assignments_;
+
     uint64_t register_connection(std::shared_ptr<Connection> connection);
     void unregister_connection(uint64_t connection_id);
     void shutdown_active_connections();
@@ -57,6 +71,23 @@ private:
     void handle_connection_thread(std::shared_ptr<Connection> connection,
                                   uint64_t connection_id);
     int handle_connection(Connection& conn);
+    int handle_relay_discovery(
+        Connection& conn,
+        RelayConnection& relay_connection,
+        const RelayDiscoveryRequest& request
+    );
+
+    // This is post relay discovery action
+    int handle_relay_assignment(
+        Connection& conn,
+        RelayConnection& relay_connection,
+        const RelayAssignmentRequest& request
+    );
+    bool store_relay_assignment(
+        const std::string& coordinator_ip,
+        const RelayAssignmentRequest& request,
+        std::string& rejection_reason
+    );
 
     /*
      * Receives only the missing range of one file into its .part file.

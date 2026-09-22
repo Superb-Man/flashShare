@@ -29,7 +29,9 @@ enum class MessageType : uint8_t {
     RESUME_REQUEST    = 9,
     RESUME_RESPONSE   = 10,
     RELAY_DISCOVERY_REQUEST  = 11,
-    RELAY_DISCOVERY_RESPONSE = 12
+    RELAY_DISCOVERY_RESPONSE = 12,
+    RELAY_ASSIGNMENT_REQUEST = 13,
+    RELAY_ASSIGNMENT_RESPONSE = 14
 };
 
 struct FileEntry {
@@ -66,6 +68,10 @@ public:
     ~Connection();
 
     bool send_transfer_request(const TransferRequest& req);
+
+    // RelayConnection::recv_initial_request() to dispatch transfer and relay
+    // control messages arriving on the same listening port.
+    // Obsolete
     bool recv_transfer_request(TransferRequest& req);
 
     bool send_transfer_response(const TransferResponse& resp);

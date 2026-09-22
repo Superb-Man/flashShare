@@ -129,6 +129,8 @@ bool parse_args(int argc, char* argv[], Args& args) {
         args.command = Command::SEND;
     } else if (cmd == "recv") {
         args.command = Command::RECV;
+    } else if (cmd == "relay") {
+        args.command = Command::RELAY;
     } else {
         fprintf(stderr, "Unknown command: %s\n\n", cmd.c_str());
         print_help();
@@ -161,6 +163,10 @@ bool parse_args(int argc, char* argv[], Args& args) {
             args.log_file = argv[++i];
         } else if (arg == "--daemon") {
             args.daemon = true;
+        } else if (arg == "--next" && i + 1 < argc) {
+            args.next_host = argv[++i];
+        } else if (arg == "--next-port" && i + 1 < argc) {
+            args.next_port = static_cast<uint16_t>(atoi(argv[++i]));
         } else if (arg == "-h" || arg == "--help") {
             print_help();
             return false;
@@ -180,6 +186,12 @@ bool parse_args(int argc, char* argv[], Args& args) {
     // Validate
     if (args.command == Command::SEND && args.paths.empty()) {
         fprintf(stderr, "Error: send requires at least one file or directory path\n");
+        print_help();
+        return false;
+    }
+
+    if (args.command == Command::RELAY && args.next_host.empty()) {
+        fprintf(stderr, "Error: relay requires --next <next-hop-ip>\n");
         print_help();
         return false;
     }

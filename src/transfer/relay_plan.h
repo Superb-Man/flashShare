@@ -13,9 +13,9 @@ struct RelayEndpoint {
 
 // for connection
 struct RelayProbeResult {
-    RelayEndpoint endpoint;
-    bool responded = false;
-    bool available = false;
+    RelayEndpoint endpoint; 
+    bool responded = false; // whether the endpoint responded to the probe created by the relay coordinator
+    bool available = false; // whether the endpoint is available for relay participation
     std::string message;
 };
 

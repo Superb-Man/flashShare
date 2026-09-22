@@ -357,40 +357,230 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
     return true;
 }
 
-// Handles one accepted sender connection on a thread-pool worker.
+
+int Receiver::handle_relay_discovery(
+    Connection& conn,
+    RelayConnection& relay_connection,
+    const RelayDiscoveryRequest& request
+) {
+    RelayDiscoveryResponse response;
+    response.discovery_id = request.discovery_id;
+
+    if (request.version != PROTOCOL_VERSION) {
+        response.message = "protocol version mismatch";
+    } else if (request.file_count == 0) {
+        response.message = "relay transfer contains no files";
+    } else {
+        response.available = true;
+        response.message = "available";
+    }
+
+    // Discovery is a small control exchange. Flush its response immediately
+    // instead of retaining it behind the data-transfer TCP_CORK setting.
+    conn.socket().set_cork(false);
+
+    if (!relay_connection.send_discovery_response(response)) {
+        LOG_ERROR(
+            "Failed to send relay discovery response to %s",
+            conn.socket().peer_address().c_str()
+        );
+        return 1;
+    }
+
+    if (response.available) {
+        LOG_INFO(
+            "Available for relay discovery %s from %s",
+            request.discovery_id.c_str(),
+            conn.socket().peer_address().c_str()
+        );
+    } else {
+        LOG_WARN(
+            "Rejected relay discovery %s from %s: %s",
+            request.discovery_id.c_str(),
+            conn.socket().peer_address().c_str(),
+            response.message.c_str()
+        );
+    }
+
+    return 0;
+}
+
+bool Receiver::store_relay_assignment(
+    const std::string& coordinator_ip,
+    const RelayAssignmentRequest& request,
+    std::string& rejection_reason
+) {
+    std::lock_guard<std::mutex> lock(relay_assignments_mutex_);
+
+    auto assigned = relay_assignments_.find(request.transfer_id);
+
+    if (assigned != relay_assignments_.end()) {
+        const RelayAssignment& existing = assigned->second;
+        const bool same_assignment =
+            existing.coordinator_ip == coordinator_ip &&
+            existing.discovery_id == request.discovery_id &&
+            existing.total_size == request.total_size &&
+            existing.file_count == request.file_count &&
+            existing.has_downstream == request.has_downstream &&
+            existing.downstream_address == request.downstream_address &&
+            existing.downstream_port == request.downstream_port;
+
+        if (same_assignment) {
+            return true;
+        }
+
+        rejection_reason = "transfer ID conflicts with an existing relay assignment";
+        return false;
+    }
+
+    if (!request.has_downstream && !request.downstream_address.empty()) {
+        rejection_reason = "final relay node cannot have a downstream address";
+        return false;
+    }
+
+    RelayAssignment assignment;
+    assignment.coordinator_ip = coordinator_ip;
+    assignment.discovery_id = request.discovery_id;
+    assignment.total_size = request.total_size;
+    assignment.file_count = request.file_count;
+    assignment.has_downstream = request.has_downstream;
+    assignment.downstream_address = request.downstream_address;
+    assignment.downstream_port = request.downstream_port;
+
+    relay_assignments_.emplace(request.transfer_id, std::move(assignment));
+    return true;
+}
+
+int Receiver::handle_relay_assignment(
+    Connection& conn,
+    RelayConnection& relay_connection,
+    const RelayAssignmentRequest& request
+) {
+    RelayAssignmentResponse response;
+    response.discovery_id = request.discovery_id;
+    response.transfer_id = request.transfer_id;
+
+    if (request.version != PROTOCOL_VERSION) {
+        response.message = "protocol version mismatch";
+    } else {
+        response.accepted = store_relay_assignment(
+            conn.socket().peer_address(),
+            request,
+            response.message
+        );
+
+        if (response.accepted) {
+            response.message = "assigned";
+        }
+    }
+
+    conn.socket().set_cork(false);
+
+    if (!relay_connection.send_assignment_response(response)) {
+        LOG_ERROR(
+            "Failed to send relay assignment response to %s",
+            conn.socket().peer_address().c_str()
+        );
+        return 1;
+    }
+
+    if (response.accepted) {
+        if (request.has_downstream) {
+            LOG_INFO(
+                "Assigned relay transfer %s; downstream %s:%u",
+                request.transfer_id.c_str(),
+                request.downstream_address.c_str(),
+                request.downstream_port
+            );
+        } else {
+            LOG_INFO(
+                "Assigned relay transfer %s as final node",
+                request.transfer_id.c_str()
+            );
+        }
+    } else {
+        LOG_WARN(
+            "Rejected relay assignment %s from %s: %s",
+            request.transfer_id.c_str(),
+            conn.socket().peer_address().c_str(),
+            response.message.c_str()
+        );
+    }
+
+    return response.accepted ? 0 : 1;
+}
+
+// Handles one accepted connection on a thread-pool worker.
 //
-// Recovery identity:
-// - sender_public_ip selects the receiver output directory:
-//     <out-dir>/<sender-public-ip>/
-// - transfer_id selects the persistent recovery journal inside that directory.
-// - The journal contains every file's allocated final name, .part path,
+// Initial-message routing:
+// 1. Read the first framed message once.
+// 2. RELAY_DISCOVERY_REQUEST reports whether this receiver is available.
+// 3. RELAY_ASSIGNMENT_REQUEST stores this receiver's downstream role.
+// 4. TRANSFER_REQUEST continues through the existing file-transfer flow.
+//
+// Transfer recovery identity:
+// - peer_address() selects the receiver output directory:
+//     <out-dir>/<immediate-upstream-ip>/
+// - For a direct or fan-out transfer, the immediate upstream is the sender.
+// - For a relay transfer, it may be the previous relay node.
+// - transfer_id selects the persistent recovery journal in that directory.
+// - The journal stores each file's allocated final name, .part path,
 //   expected size/hash, and receiver-confirmed durable byte offset.
 //
-// Connection flow:
-// 1. Receive and validate the sender manifest.
-// 2. Ask the user to accept, unless --accept-all is enabled.
-// 3. Load an existing journal for this sender IP + transfer ID, or create a
-//    new journal and reserve unique final filenames such as "file (1).txt".
-// 4. Lock this transfer so two live connections cannot write the same .part
-//    file at the same time.
+// TRANSFER_REQUEST flow:
+// 1. Validate the sender's manifest.
+// 2. Ask the user to accept unless --accept-all is enabled.
+// 3. Load the existing recovery journal for the upstream IP and transfer ID,
+//    or create one and reserve unique final filenames such as "file (1).txt".
+// 4. Lock the transfer so two live connections cannot modify the same .part
+//    files concurrently.
 // 5. Return one durable resume offset per manifest file.
-// 6. For every FILE_HEADER, verify index, path, full size, and sender offset
-//    exactly match the saved receiver state before accepting file bytes.
-// 7. Receive remaining bytes into .part files, verify SHA-256, then atomically
-//    rename each verified .part file to its reserved final destination.
-// 8. Mark the whole journal complete only after TRANSFER_COMPLETE arrives.
+// 6. For each FILE_HEADER, verify its index, path, complete size, and sender
+//    offset against the saved receiver state.
+// 7. Receive the remaining bytes into .part files, verify SHA-256, and
+//    atomically rename each verified file to its final destination.
+// 8. Mark the journal complete only after TRANSFER_COMPLETE is received.
 //
-// If the connection breaks at any point, this function returns while retaining
-// the journal and .part files. A later sender reconnect with the same
-// transfer_id receives the stored offsets and continues safely.
-//
-// Note: peer_address() is the IP visible to this receiver. On a LAN it is
-// normally the sender's private LAN IP; it is a public IP only when that is
-// what the TCP connection exposes.
+// If a data connection breaks, the function returns while retaining its
+// journal and .part files. A later upstream connection using the same
+// transfer_id receives the stored offsets and can continue safely.
 int Receiver::handle_connection(Connection& conn) {
-    TransferRequest req;
-    if (!conn.recv_transfer_request(req)) {
-        LOG_ERROR("Failed to receive transfer request");
+    MessageType initial_type{};
+    TransferRequest req{};
+    RelayDiscoveryRequest discovery_request;
+    RelayAssignmentRequest assignment_request;
+    RelayConnection relay_connection(conn);
+
+    if (!relay_connection.recv_initial_request(
+            initial_type,
+            req,
+            discovery_request,
+            assignment_request)) {
+        LOG_ERROR("Failed to receive initial request");
+        return 1;
+    }
+
+    if (initial_type == MessageType::RELAY_DISCOVERY_REQUEST) {
+        return handle_relay_discovery(
+            conn,
+            relay_connection,
+            discovery_request
+        );
+    }
+
+    if (initial_type == MessageType::RELAY_ASSIGNMENT_REQUEST) {
+        return handle_relay_assignment(
+            conn,
+            relay_connection,
+            assignment_request
+        );
+    }
+
+    if (initial_type != MessageType::TRANSFER_REQUEST) {
+        LOG_ERROR(
+            "Unsupported initial request type: %d",
+            static_cast<int>(initial_type)
+        );
         return 1;
     }
 

@@ -107,31 +107,27 @@ bool json_get_bool(const std::string& json, const std::string& key) {
 
 RelayConnection::RelayConnection(Connection& connection) : connection_(connection) {}
 
-std::string RelayConnection::serialize_request(const RelayDiscoveryRequest& request) const {
+std::string RelayConnection::serialize_discovery_request(const RelayDiscoveryRequest& request) const {
     std::ostringstream json;
     json << "{"
          << "\"version\":" << request.version << ","
          << "\"discovery_id\":\"" << json_escape(request.discovery_id) << "\","
          << "\"total_size\":" << request.total_size << ","
-         << "\"file_count\":" << request.file_count << ","
-         << "\"reservation_ms\":" << request.reservation_ms
+         << "\"file_count\":" << request.file_count
          << "}";
     return json.str();
 }
 
-bool RelayConnection::deserialize_request(const std::string& json, RelayDiscoveryRequest& request) const {
+bool RelayConnection::deserialize_discovery_request(const std::string& json, RelayDiscoveryRequest& request) const {
     request.version = static_cast<uint32_t>(json_get_u64(json, "version"));
     request.discovery_id = json_get_string(json, "discovery_id");
     request.total_size = json_get_u64(json, "total_size");
     request.file_count = static_cast<uint32_t>(json_get_u64(json, "file_count"));
-    request.reservation_ms = static_cast<uint32_t>(
-        json_get_u64(json, "reservation_ms")
-    );
 
     return !request.discovery_id.empty();
 }
 
-std::string RelayConnection::serialize_response(const RelayDiscoveryResponse& response) const {
+std::string RelayConnection::serialize_discovery_response(const RelayDiscoveryResponse& response) const {
     std::ostringstream json;
     json << "{"
          << "\"discovery_id\":\"" << json_escape(response.discovery_id) << "\","
@@ -141,7 +137,7 @@ std::string RelayConnection::serialize_response(const RelayDiscoveryResponse& re
     return json.str();
 }
 
-bool RelayConnection::deserialize_response(const std::string& json, RelayDiscoveryResponse& response) const {
+bool RelayConnection::deserialize_discovery_response(const std::string& json, RelayDiscoveryResponse& response) const {
     response.discovery_id = json_get_string(json, "discovery_id");
     response.available = json_get_bool(json, "available");
     response.message = json_get_string(json, "message");
@@ -150,7 +146,7 @@ bool RelayConnection::deserialize_response(const std::string& json, RelayDiscove
 }
 
 bool RelayConnection::send_discovery_request(const RelayDiscoveryRequest& request) {
-    const std::string json = serialize_request(request);
+    const std::string json = serialize_discovery_request(request);
     return connection_.send_frame(
         MessageType::RELAY_DISCOVERY_REQUEST,
         json.data(),
@@ -175,7 +171,7 @@ bool RelayConnection::recv_discovery_response(RelayDiscoveryResponse& response) 
     }
 
     const std::string json(payload.begin(), payload.end());
-    return deserialize_response(json, response);
+    return deserialize_discovery_response(json, response);
 }
 
 bool RelayConnection::recv_discovery_request(RelayDiscoveryRequest& request) {
@@ -195,13 +191,135 @@ bool RelayConnection::recv_discovery_request(RelayDiscoveryRequest& request) {
     }
 
     const std::string json(payload.begin(), payload.end());
-    return deserialize_request(json, request);
+    return deserialize_discovery_request(json, request);
 }
 
 bool RelayConnection::send_discovery_response(const RelayDiscoveryResponse& response) {
-    const std::string json = serialize_response(response);
+    const std::string json = serialize_discovery_response(response);
     return connection_.send_frame(
         MessageType::RELAY_DISCOVERY_RESPONSE,
+        json.data(),
+        json.size()
+    );
+}
+
+std::string RelayConnection::serialize_assignment_request(
+    const RelayAssignmentRequest& request) const {
+    std::ostringstream json;
+    json << "{"
+         << "\"version\":" << request.version << ","
+         << "\"discovery_id\":\"" << json_escape(request.discovery_id) << "\","
+         << "\"transfer_id\":\"" << json_escape(request.transfer_id) << "\","
+         << "\"total_size\":" << request.total_size << ","
+         << "\"file_count\":" << request.file_count << ","
+         << "\"has_downstream\":" << (request.has_downstream ? "true" : "false") << ","
+         << "\"downstream_address\":\"" << json_escape(request.downstream_address) << "\","
+         << "\"downstream_port\":" << request.downstream_port
+         << "}";
+    return json.str();
+}
+
+bool RelayConnection::deserialize_assignment_request(
+    const std::string& json,
+    RelayAssignmentRequest& request) const {
+    request.version = static_cast<uint32_t>(json_get_u64(json, "version"));
+    request.discovery_id = json_get_string(json, "discovery_id");
+    request.transfer_id = json_get_string(json, "transfer_id");
+    request.total_size = json_get_u64(json, "total_size");
+    request.file_count = static_cast<uint32_t>(json_get_u64(json, "file_count"));
+    request.has_downstream = json_get_bool(json, "has_downstream");
+    request.downstream_address = json_get_string(json, "downstream_address");
+    request.downstream_port = static_cast<uint16_t>(
+        json_get_u64(json, "downstream_port")
+    );
+
+    if (request.discovery_id.empty() || request.transfer_id.empty() ||
+        request.file_count == 0) {
+        return false;
+    }
+
+    if (request.has_downstream &&
+        (request.downstream_address.empty() || request.downstream_port == 0)) {
+        return false;
+    }
+
+    return true;
+}
+
+std::string RelayConnection::serialize_assignment_response(
+    const RelayAssignmentResponse& response) const {
+    std::ostringstream json;
+    json << "{"
+         << "\"discovery_id\":\"" << json_escape(response.discovery_id) << "\","
+         << "\"transfer_id\":\"" << json_escape(response.transfer_id) << "\","
+         << "\"accepted\":" << (response.accepted ? "true" : "false") << ","
+         << "\"message\":\"" << json_escape(response.message) << "\""
+         << "}";
+    return json.str();
+}
+
+bool RelayConnection::deserialize_assignment_response(
+    const std::string& json,
+    RelayAssignmentResponse& response) const {
+    response.discovery_id = json_get_string(json, "discovery_id");
+    response.transfer_id = json_get_string(json, "transfer_id");
+    response.accepted = json_get_bool(json, "accepted");
+    response.message = json_get_string(json, "message");
+
+    return !response.discovery_id.empty() && !response.transfer_id.empty();
+}
+
+bool RelayConnection::send_assignment_request(
+    const RelayAssignmentRequest& request) {
+    const std::string json = serialize_assignment_request(request);
+    return connection_.send_frame(
+        MessageType::RELAY_ASSIGNMENT_REQUEST,
+        json.data(),
+        json.size()
+    );
+}
+
+bool RelayConnection::recv_assignment_response(
+    RelayAssignmentResponse& response) {
+    MessageType type;
+    std::vector<uint8_t> payload;
+
+    if (!connection_.recv_frame(type, payload)) {
+        return false;
+    }
+
+    if (type != MessageType::RELAY_ASSIGNMENT_RESPONSE) {
+        LOG_ERROR("Expected RELAY_ASSIGNMENT_RESPONSE, got %d", static_cast<int>(type));
+        return false;
+    }
+
+    const std::string json(payload.begin(), payload.end());
+    return deserialize_assignment_response(json, response);
+}
+
+bool RelayConnection::recv_assignment_request(
+    RelayAssignmentRequest& request) {
+    MessageType type;
+    std::vector<uint8_t> payload;
+
+    if (!connection_.recv_frame(type, payload)) {
+        return false;
+    }
+
+    if (type != MessageType::RELAY_ASSIGNMENT_REQUEST) {
+        LOG_ERROR("Expected RELAY_ASSIGNMENT_REQUEST, got %d", static_cast<int>(type));
+        return false;
+    }
+
+    const std::string json(payload.begin(), payload.end());
+    return deserialize_assignment_request(json, request);
+}
+
+bool RelayConnection::send_assignment_response(
+    const RelayAssignmentResponse& response) {
+    const std::string json = serialize_assignment_response(response);
+    return connection_.send_frame(
+        MessageType::RELAY_ASSIGNMENT_RESPONSE,
         json.data(),
         json.size()
     );
@@ -210,7 +328,8 @@ bool RelayConnection::send_discovery_response(const RelayDiscoveryResponse& resp
 bool RelayConnection::recv_initial_request(
     MessageType& type,
     TransferRequest& transfer_request,
-    RelayDiscoveryRequest& discovery_request
+    RelayDiscoveryRequest& discovery_request,
+    RelayAssignmentRequest& assignment_request
 ) {
     std::vector<uint8_t> payload;
     if (!connection_.recv_frame(type, payload)) {
@@ -224,7 +343,10 @@ bool RelayConnection::recv_initial_request(
             return connection_.deserialize_request(json, transfer_request);
 
         case MessageType::RELAY_DISCOVERY_REQUEST:
-            return deserialize_request(json, discovery_request);
+            return deserialize_discovery_request(json, discovery_request);
+
+        case MessageType::RELAY_ASSIGNMENT_REQUEST:
+            return deserialize_assignment_request(json, assignment_request);
 
         default:
             LOG_ERROR(

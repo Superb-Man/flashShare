@@ -278,6 +278,9 @@ bool Connection::send_transfer_request(const TransferRequest& req) {
     );
 }
 
+// RelayConnection::recv_initial_request() because its first frame may instead
+// be a relay discovery or assignment request.
+// Obsolete
 bool Connection::recv_transfer_request(TransferRequest& req) {
     MessageType type;
     std::vector<uint8_t> payload;
