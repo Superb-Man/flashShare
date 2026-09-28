@@ -17,14 +17,15 @@ public:
     Sender(const std::vector<std::string>& paths, const std::string& target_ip,
            uint16_t port, bool encrypt, bool resume);
 
-    // Fanout multiple connections for parallel file transfer
+    // Reuse a prepared manifest for fan-out or relay transfer.
     Sender(std::shared_ptr<const PreparedManifest> manifest,
            const std::string& target_ip,
            uint16_t port,
            bool encrypt,
            bool resume,
            bool show_progress = false,
-           std::string transfer_id = "");
+           std::string transfer_id = "",
+           bool relay_chain = false);
 
     // Run the send operation
     int run();
@@ -59,6 +60,7 @@ private:
     bool encrypt_;
     bool resume_;
     bool show_progress_ = true;
+    bool relay_chain_ = false;
     std::string requested_transfer_id_;
 
     TransferSession session_;

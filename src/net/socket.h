@@ -59,6 +59,7 @@ public:
     // Connect to remote address:port
     bool connect(const std::string& address, uint16_t port, int timeout_sec = 10);
     bool relay_connect(const std::string& address, uint16_t port, std::chrono::milliseconds timeout);
+    bool relay_connect_blocking(const std::string& address, uint16_t port);
 
     // Set socket buffer sizes (SO_SNDBUF / SO_RCVBUF)
     bool set_buffer_size(int send_buf, int recv_buf);

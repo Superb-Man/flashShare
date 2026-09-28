@@ -1,0 +1,51 @@
+name: flashshare-fanout
+
+services:
+  receiver1:
+    image: flashshare:fanout
+    container_name: fs-fanout-r1
+    networks:
+      fsnet:
+        ipv4_address: 172.30.118.11
+    volumes: ["recv1-out:/data/out"]
+    command: ["recv", "--port", "5117", "--out", "/data/out", "--accept-all", "--verbose"]
+
+  receiver2:
+    image: flashshare:fanout
+    container_name: fs-fanout-r2
+    networks:
+      fsnet:
+        ipv4_address: 172.30.118.12
+    volumes: ["recv2-out:/data/out"]
+    command: ["recv", "--port", "5117", "--out", "/data/out", "--accept-all", "--verbose"]
+
+  receiver3:
+    image: flashshare:fanout
+    container_name: fs-fanout-r3
+    networks:
+      fsnet:
+        ipv4_address: 172.30.118.13
+    volumes: ["recv3-out:/data/out"]
+    command: ["recv", "--port", "5117", "--out", "/data/out", "--accept-all", "--verbose"]
+
+  sender:
+    image: flashshare:fanout
+    build: { context: ., dockerfile: Dockerfile.flashshare }
+    container_name: fs-fanout-sender
+    networks:
+      fsnet:
+        ipv4_address: 172.30.118.10
+    depends_on: [receiver1, receiver2, receiver3]
+    volumes: ["./testfiles/a.bin:/data/a.bin:ro"]
+    command: ["send", "/data/a.bin", "--to", "172.30.118.11,172.30.118.12,172.30.118.13", "--port", "5117", "--resume"]
+
+networks:
+  fsnet:
+    ipam:
+      config:
+        - subnet: 172.30.118.0/24
+
+volumes:
+  recv1-out:
+  recv2-out:
+  recv3-out:

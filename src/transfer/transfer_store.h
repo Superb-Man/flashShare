@@ -74,6 +74,10 @@ public:
     // Returns receiver-confirmed offsets in manifest/file-index order.
     std::vector<uint64_t> resume_offsets(const StoredTransfer& transfer) const;
 
+    // Absolute path complete_file() renames a finished file to. A relay node
+    // needs it because completing a file removes its .part source.
+    std::string final_path(const std::string& sender_public_ip, const StoredFileProgress& file) const;
+
     // Mark a connection as owning this transfer. False means another live
     // connection already owns it; this prevents concurrent writes to .part files.
     bool acquire_session(const std::string& sender_public_ip, const std::string& transfer_id);

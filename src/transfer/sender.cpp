@@ -72,9 +72,11 @@ Sender::Sender(std::shared_ptr<const PreparedManifest> manifest,
                bool encrypt,
                bool resume,
                bool show_progress,
-               std::string transfer_id)
+               std::string transfer_id,
+               bool relay_chain)
     : target_ip_(target_ip), port_(port),
       encrypt_(encrypt), resume_(resume), show_progress_(show_progress),
+      relay_chain_(relay_chain),
       requested_transfer_id_(std::move(transfer_id)) {
     session_.manifest = std::move(manifest);
 }
@@ -82,8 +84,8 @@ Sender::Sender(std::shared_ptr<const PreparedManifest> manifest,
 // Sends one file from the exact durable byte offset confirmed by the receiver.
 //
 // The sender never assumes that a successful sendfile()/send() call means the
-// receiver stored those bytes. After a broken connection, it reconnects and
-// uses a new receiver-confirmed offset before sending again.
+// receiver stored those bytes. Direct and fan-out retries reconnect using
+// a new receiver-confirmed offset; relay-chain attempts do not retry.
 bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_index, uint64_t receiver_confirmed_offset, ProgressBar* progress) {
     if (receiver_confirmed_offset > file.size) {
         LOG_ERROR("Receiver returned invalid offset for %s: %llu > %llu",
@@ -227,8 +229,8 @@ bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_in
 }
 
 // Opens a new TCP connection and asks the receiver for its durable offsets.
-// The same TransferSession is used for every retry, including its transfer ID
-// and original manifest, so the receiver can find the correct recovery journal.
+// Direct and fan-out retries reuse the same transfer ID and manifest so the
+// receiver can find the correct recovery journal.
 bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_ptr<Connection>& conn, std::vector<uint64_t>& resume_offsets) {
     conn.reset();
     resume_offsets.clear();
@@ -242,15 +244,18 @@ bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_p
 
     socket.set_buffer_size(4 * 1024 * 1024, 4 * 1024 * 1024);
 
-    if (!socket.connect(target_ip_, port_, 10)) {
+    const bool connected = relay_chain_
+        ? socket.relay_connect_blocking(target_ip_, port_)
+        : socket.connect(target_ip_, port_, 10);
+    if (!connected) {
         LOG_ERROR("Cannot connect to receiver %s:%u",
                   target_ip_.c_str(), port_);
         return false;
     }
 
     constexpr int SEND_TIMEOUT_SECONDS = 15;
-    if (!socket.set_send_timeout(SEND_TIMEOUT_SECONDS)) {
-            LOG_ERROR("Cannot set send timeout for %s:%u: %s", target_ip_.c_str(), port_, strerror(errno));
+    if (!relay_chain_ && !socket.set_send_timeout(SEND_TIMEOUT_SECONDS)) {
+        LOG_ERROR("Cannot set send timeout for %s:%u: %s", target_ip_.c_str(), port_, strerror(errno));
         return false;
     }
     socket.set_nodelay(true);
@@ -265,6 +270,7 @@ bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_p
     request.total_size = manifest.total_size;
     request.encrypted = encrypt_;
     request.resume = resume_;
+    request.completion_ack = relay_chain_;
 
     if (!candidate->send_transfer_request(request)) {
         LOG_ERROR("Failed to send transfer request");
@@ -282,6 +288,12 @@ bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_p
             ? "Transfer rejected by receiver"
             : "Transfer rejected: " + response.message;
         LOG_ERROR("Transfer rejected by receiver: %s",response.message.empty() ? "no reason supplied" : response.message.c_str());
+        return false;
+    }
+
+    if (relay_chain_ && !response.completion_ack) {
+        LOG_ERROR("Receiver %s:%u does not support chain completion acknowledgements",
+                  target_ip_.c_str(), port_);
         return false;
     }
 
@@ -377,6 +389,18 @@ bool Sender::send_attempt(const TransferSession& session,
         return false;
     }
 
+    if (relay_chain_) {
+        conn.socket().set_cork(false);
+
+        MessageType reply{};
+
+        if (!conn.recv_message(reply) || reply != MessageType::TRANSFER_ACK) {
+            LOG_ERROR("Relay chain did not confirm completion of transfer %s", session.transfer_id.c_str());
+            return false;
+        }
+        LOG_INFO("Relay chain confirmed transfer %s", session.transfer_id.c_str());
+    }
+
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - overall_start).count();
 
     LOG_INFO("Connection attempt sent %llu remaining byte(s) in %.1fs",
@@ -410,8 +434,8 @@ int Sender::run() {
             throw std::runtime_error("No files found in source paths");
         }
 
-        // One destination's identity stays stable throughout all retries.
-        // Relay mode supplies the ID already distributed to its receivers.
+        // One destination's identity stays stable through any direct/fan-out
+        // retries. Relay mode supplies the ID already sent to its receivers.
         session_.transfer_id = requested_transfer_id_.empty()
             ? make_transfer_id()
             : requested_transfer_id_;
@@ -420,7 +444,7 @@ int Sender::run() {
                  session_.manifest->files.size(),
                  static_cast<unsigned long long>(session_.manifest->total_size));
 
-        // Preserve the original limit of ten total attempts with --resume.
+        // Direct and fan-out transfers retain ten total attempts with --resume.
         constexpr unsigned int MAX_ATTEMPTS = 10;
         unsigned int failed_attempts = 0;
 
@@ -445,6 +469,12 @@ int Sender::run() {
                 last_error_ = connected
                     ? "File transmission failed"
                     : "Connection or transfer negotiation failed";
+            }
+
+            if (relay_chain_) {
+                LOG_ERROR("[%s:%u] Relay chain transfer failed: %s",
+                          target_ip_.c_str(), port_, last_error_.c_str());
+                return finish(1);
             }
 
             ++failed_attempts;

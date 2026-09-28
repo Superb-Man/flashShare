@@ -141,22 +141,10 @@ bool RelayCoordinator::send_assignment(
         return false;
     }
 
-    if (!socket.relay_connect(
-            receiver.address,
-            receiver.port,
-            discovery_timeout_)) {
+    // Discovery has already selected this node; assignment has no transfer timeout.
+    if (!socket.relay_connect_blocking(receiver.address, receiver.port)) {
         LOG_ERROR(
             "[%s:%u] Cannot connect for relay assignment",
-            receiver.address.c_str(),
-            receiver.port
-        );
-        return false;
-    }
-
-    if (!socket.relay_set_send_timeout(discovery_timeout_) ||
-        !socket.relay_set_recv_timeout(discovery_timeout_)) {
-        LOG_ERROR(
-            "[%s:%u] Cannot configure relay-assignment timeout",
             receiver.address.c_str(),
             receiver.port
         );

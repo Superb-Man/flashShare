@@ -37,6 +37,7 @@ add_executable(flashshare
     src/transfer/fanout_sender.cpp
     src/transfer/relay_discovery.cpp
     src/transfer/relay_coordinator.cpp
+    src/transfer/relay_forwarder.cpp
 )
 
 target_include_directories(flashshare PRIVATE src)

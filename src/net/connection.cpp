@@ -212,6 +212,7 @@ std::string Connection::serialize_request(const TransferRequest& req) {
     ss << "\"total_size\":" << req.total_size << ",";
     ss << "\"encrypted\":" << (req.encrypted ? "true" : "false") << ",";
     ss << "\"resume\":" << (req.resume ? "true" : "false") << ",";
+    ss << "\"completion_ack\":" << (req.completion_ack ? "true" : "false") << ",";
     ss << "\"files\":[";
     for (size_t i = 0; i < req.files.size(); ++i) {
         const auto& f = req.files[i];
@@ -233,6 +234,7 @@ bool Connection::deserialize_request(const std::string& json, TransferRequest& r
     req.total_size = json_get_u64(json, "total_size");
     req.encrypted = json_get_bool(json, "encrypted");
     req.resume = json_get_bool(json, "resume");
+    req.completion_ack = json_get_bool(json, "completion_ack");
     req.files = json_get_files(json);
     return true;
 }
@@ -241,6 +243,7 @@ std::string Connection::serialize_response(const TransferResponse& resp) {
     std::ostringstream ss;
     ss << "{";
     ss << "\"accepted\":" << (resp.accepted ? "true" : "false") << ",";
+    ss << "\"completion_ack\":" << (resp.completion_ack ? "true" : "false") << ",";
     ss << "\"message\":\"" << json_escape(resp.message) << "\",";
     ss << "\"resume_offsets\":[";
     for (size_t i = 0; i < resp.resume_offsets.size(); ++i) {
@@ -253,6 +256,7 @@ std::string Connection::serialize_response(const TransferResponse& resp) {
 
 bool Connection::deserialize_response(const std::string& json, TransferResponse& resp) {
     resp.accepted = json_get_bool(json, "accepted");
+    resp.completion_ack = json_get_bool(json, "completion_ack");
     resp.message = json_get_string(json, "message");
     resp.resume_offsets = json_get_offsets(json);
     return true;

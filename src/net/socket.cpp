@@ -143,6 +143,24 @@ bool Socket::connect(const std::string& address, uint16_t port, int timeout_sec)
     return relay_connect(address, port, std::chrono::seconds(timeout_sec));
 }
 
+bool Socket::relay_connect_blocking(const std::string& address, uint16_t port) {
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+
+    if (inet_pton(AF_INET, address.c_str(), &addr.sin_addr) != 1) {
+        LOG_ERROR("Invalid address: %s", address.c_str());
+        return false;
+    }
+
+    if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        LOG_ERROR("connect() failed: %s", strerror(GET_ERRNO));
+        return false;
+    }
+
+    return true;
+}
+
 bool Socket::relay_connect(const std::string& address, uint16_t port,
                            std::chrono::milliseconds timeout) {
     const auto timeout_ms = timeout.count();

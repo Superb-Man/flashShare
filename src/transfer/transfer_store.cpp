@@ -329,6 +329,11 @@ std::vector<uint64_t> TransferStore::resume_offsets(
     return offsets;
 }
 
+std::string TransferStore::final_path(const std::string& sender_public_ip,
+                                      const StoredFileProgress& file) const {
+    return (fs::path(sender_dir(sender_public_ip)) / file.final_relpath).string();
+}
+
 bool TransferStore::acquire_session(const std::string& sender_public_ip,
                                     const std::string& transfer_id) {
     std::lock_guard<std::mutex> lock(mutex_);

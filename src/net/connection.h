@@ -31,7 +31,8 @@ enum class MessageType : uint8_t {
     RELAY_DISCOVERY_REQUEST  = 11,
     RELAY_DISCOVERY_RESPONSE = 12,
     RELAY_ASSIGNMENT_REQUEST = 13,
-    RELAY_ASSIGNMENT_RESPONSE = 14
+    RELAY_ASSIGNMENT_RESPONSE = 14,
+    TRANSFER_ACK = 15
 };
 
 struct FileEntry {
@@ -48,10 +49,12 @@ struct TransferRequest {
     uint64_t total_size;
     bool encrypted;
     bool resume;
+    bool completion_ack = false; // Chain nodes must acknowledge verified completion.
 };
 
 struct TransferResponse {
     bool accepted;
+    bool completion_ack = false;
 
     // A completed file returns its complete size.
     std::vector<uint64_t> resume_offsets;

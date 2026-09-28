@@ -3,12 +3,69 @@
 #include "transfer/sender.h"
 #include "transfer/fanout_sender.h"
 #include "transfer/receiver.h"
+#include "transfer/relay_coordinator.h"
+#include "transfer/relay_plan.h"
 #include "net/socket.h"
 #include <signal.h>
 
 #include <cstdio>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace flashshare;
+
+// Builds and assigns a relay chain across the --to receivers, then streams the
+// transfer into its head node. Every downstream hop is driven by the relay
+// nodes themselves, so the sender only ever transmits one copy of the file.
+int run_relay_send(const Args& args) {
+    std::vector<RelayEndpoint> candidates;
+    candidates.reserve(args.targets.size());
+
+    for (const auto& target : args.targets) {
+        RelayEndpoint endpoint;
+        endpoint.address = target;
+        endpoint.port = args.port;
+        candidates.push_back(std::move(endpoint));
+    }
+
+    RelayCoordinator coordinator(args.paths, std::move(candidates));
+
+    RelayPlan plan;
+    if (!coordinator.build_plan(plan)) {
+        LOG_ERROR("Cannot start relay transfer: %s",
+                  coordinator.last_error().c_str());
+        return 1;
+    }
+
+    if (!coordinator.assign_plan(plan)) {
+        LOG_ERROR("Cannot start relay transfer: %s",
+                  coordinator.last_error().c_str());
+        return 1;
+    }
+
+    std::string chain;
+    for (const auto& node : plan.nodes) {
+        chain += " -> " + node.address;
+    }
+    LOG_INFO("Relay chain for transfer %s: sender%s",
+             plan.transfer_id.c_str(), chain.c_str());
+
+    const RelayEndpoint& head = plan.nodes.front();
+
+    Sender sender(
+        coordinator.manifest(),
+        head.address,
+        head.port,
+        args.encrypt,
+        args.resume,
+        true,
+        plan.transfer_id,
+        plan.is_chain());
+
+    return sender.run();
+}
+
 
 int main(int argc, char* argv[]) {
     // Initialize networking (Winsock on Windows, no-op on Linux)
@@ -49,6 +106,10 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
+            if (args.relay) {
+                return run_relay_send(args);
+            }
+
             if (args.targets.size() == 1) {
                 Sender sender(
                     args.paths,
@@ -74,6 +135,12 @@ int main(int argc, char* argv[]) {
         case Command::RECV: {
             Receiver receiver(args.port, args.out_dir, args.accept_all, args.daemon, args.log_file);
             return receiver.run();
+        }
+
+        case Command::RELAY: {
+            // Relay mode is handled within the send command
+            LOG_ERROR("Relay mode should be used with the send command");
+            return 1;
         }
     }
 

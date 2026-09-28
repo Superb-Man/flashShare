@@ -186,7 +186,8 @@ bool Receiver::prompt_accept(const std::string& sender_ip, const TransferRequest
 bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
                          StoredFileProgress& file,
                          bool encrypted,
-                         ProgressBar& progress) {
+                         ProgressBar& progress,
+                         RelayForwarder* forwarder) {
     // A sender still sends FILE_COMPLETE for an already-complete file when it
     // reconnects. Consume it, but never recreate or truncate the final file.
     if (file.completed) {
@@ -286,6 +287,13 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
 
             received += static_cast<uint64_t>(n);
             progress.update(received);
+
+            // write() already put these bytes in the page cache that
+            // sendfile() reads from, so the forwarding thread can send them
+            // onward now rather than waiting for the next fsync checkpoint.
+            if (forwarder) {
+                forwarder->publish(file.file_index, received);
+            }
 
             if (received - last_checkpoint >= CHECKPOINT_INTERVAL) {
                 if (!checkpoint()) {
@@ -510,6 +518,74 @@ int Receiver::handle_relay_assignment(
     return response.accepted ? 0 : 1;
 }
 
+bool Receiver::find_relay_assignment(const std::string& transfer_id, RelayAssignment& assignment) {
+    std::lock_guard<std::mutex> lock(relay_assignments_mutex_);
+
+    auto found = relay_assignments_.find(transfer_id);
+    if (found == relay_assignments_.end()) {
+        return false;
+    }
+
+    assignment = found->second;
+    return true;
+}
+
+std::unique_ptr<RelayForwarder> Receiver::start_relay_forwarder(
+    const TransferRequest& request,
+    const StoredTransfer& transfer,
+    const std::string& upstream_ip,
+    std::string& rejection_reason
+) {
+    RelayAssignment assignment;
+
+    if (!find_relay_assignment(request.transfer_id, assignment) || !assignment.has_downstream) {
+        return nullptr;
+    }
+
+    // no need for now
+    if (request.encrypted) {
+        rejection_reason = "relay forwarding does not support encrypted transfers";
+        return nullptr;
+    }
+
+    std::vector<RelayFileFlow> flows;
+    flows.reserve(transfer.files.size());
+
+    for (const StoredFileProgress& stored : transfer.files) {
+        RelayFileFlow flow;
+        flow.file_index = stored.file_index;
+
+        // Forward the sender's original relpath, not this node's possibly
+        // deduplicated final name, so the downstream manifest still matches.
+        flow.relpath = stored.requested_relpath;
+        flow.partial_path = stored.partial_path;
+        flow.final_path = transfer_store_->final_path(upstream_ip, stored);
+        flow.expected_size = stored.expected_size;
+        flow.initial_available = stored.durable_bytes;
+        flow.completed = stored.completed;
+
+        flows.push_back(std::move(flow));
+    }
+
+    auto forwarder = std::make_unique<RelayForwarder>(
+        assignment.downstream_address,
+        assignment.downstream_port,
+        request,
+        std::move(flows)
+    );
+
+    // Connect downstream before accepting upstream: if the chain cannot be
+    // formed, the sender should learn now rather than after sending a file.
+    // for now it will always forward
+    // Fault model will be handled later
+    if (!forwarder->start()) {
+        rejection_reason = "cannot start relay forwarding: " + forwarder->last_error();
+        return nullptr;
+    }
+
+    return forwarder;
+}
+
 // Handles one accepted connection on a thread-pool worker.
 //
 // Initial-message routing:
@@ -611,6 +687,15 @@ int Receiver::handle_connection(Connection& conn) {
         }
     }
 
+    if (req.completion_ack) {
+        RelayAssignment assignment;
+        if (!find_relay_assignment(req.transfer_id, assignment) ||
+            assignment.file_count != req.files.size() ||
+            assignment.total_size != req.total_size) {
+            return reject("missing or mismatched relay-chain assignment");
+        }
+    }
+
     // A first connection still needs user approval. With --accept-all this
     // returns immediately; later refinement can skip this prompt for an
     // already-approved recovered journal.
@@ -647,8 +732,19 @@ int Receiver::handle_connection(Connection& conn) {
         stored_transfer->transfer_id
     };
 
+    // A relay node must have its downstream node running before it accepts
+    // upstream, so a chain that cannot be formed fails before any bytes move.
+    std::string relay_error;
+    std::unique_ptr<RelayForwarder> forwarder = start_relay_forwarder(
+        req, *stored_transfer, sender_public_ip, relay_error);
+
+    if (!relay_error.empty()) {
+        return reject(relay_error);
+    }
+
     TransferResponse response;
     response.accepted = true;
+    response.completion_ack = req.completion_ack;
     response.resume_offsets = transfer_store_->resume_offsets(*stored_transfer);
 
     if (!conn.send_transfer_response(response)) {
@@ -695,7 +791,8 @@ int Receiver::handle_connection(Connection& conn) {
 
         ProgressBar progress(stored_file.final_relpath, stored_file.expected_size);
 
-        if (!recv_file(conn, *stored_transfer, stored_file, req.encrypted, progress)) {
+        if (!recv_file(conn, *stored_transfer, stored_file, req.encrypted, progress,
+                       forwarder.get())) {
             LOG_ERROR("Failed to receive file: %s",
                       stored_file.requested_relpath.c_str());
             return 1;
@@ -725,6 +822,10 @@ int Receiver::handle_connection(Connection& conn) {
             stored_file.completed = true;
         }
 
+        if (forwarder) {
+            forwarder->publish_verified(stored_file.file_index);
+        }
+
         progress.finish();
     }
 
@@ -734,10 +835,25 @@ int Receiver::handle_connection(Connection& conn) {
         return 1;
     }
 
+
+    if (forwarder && !forwarder->finish()) {
+        LOG_ERROR("Received transfer %s but could not relay it downstream",
+                  stored_transfer->transfer_id.c_str());
+        return 1;
+    }
+
     if (!transfer_store_->complete_transfer( sender_public_ip, stored_transfer->transfer_id)) {
         LOG_ERROR("Failed to mark transfer complete: %s",
                   stored_transfer->transfer_id.c_str());
         return 1;
+    }
+
+    if (req.completion_ack) {
+        if (!conn.send_message(MessageType::TRANSFER_ACK)) {
+            LOG_ERROR("Could not acknowledge relay-chain completion upstream");
+            return 1;
+        }
+        conn.socket().set_cork(false);
     }
 
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - overall_start).count();

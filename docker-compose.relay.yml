@@ -1,0 +1,63 @@
+name: flashshare-relay
+
+services:
+  receiver1:
+    image: flashshare:relay
+    build: { context: ., dockerfile: Dockerfile.flashshare }
+    pull_policy: build
+    container_name: fs-relay-r1
+    tty: true
+    networks:
+      fsnet:
+        ipv4_address: 172.30.119.11
+    volumes: ["recv1-out:/data/out"]
+    command: ["recv", "--port", "5117", "--out", "/data/out", "--accept-all", "--verbose"]
+
+  receiver2:
+    image: flashshare:relay
+    container_name: fs-relay-r2
+    tty: true
+    networks:
+      fsnet:
+        ipv4_address: 172.30.119.12
+    volumes: ["recv2-out:/data/out"]
+    command: ["recv", "--port", "5117", "--out", "/data/out", "--accept-all", "--verbose"]
+
+  receiver3:
+    image: flashshare:relay
+    container_name: fs-relay-r3
+    tty: true
+    networks:
+      fsnet:
+        ipv4_address: 172.30.119.13
+    volumes: ["recv3-out:/data/out"]
+    command: ["recv", "--port", "5117", "--out", "/data/out", "--accept-all", "--verbose"]
+
+  sender:
+    image: flashshare:relay
+    build: { context: ., dockerfile: Dockerfile.flashshare }
+    container_name: fs-relay-sender
+    tty: true
+    networks:
+      fsnet:
+        ipv4_address: 172.30.119.10
+    volumes: ["./testfiles/a.bin:/data/a.bin:ro"]
+    command: ["send", "/data/a.bin", "--to", "172.30.119.11,172.30.119.12,172.30.119.13", "--port", "5117", "--relay", "--verbose"]
+
+  r2-normal-sender:
+    image: flashshare:relay
+    tty: true
+    network_mode: "service:receiver2"
+    volumes: ["./testfiles/b.bin:/data/b.bin:ro"]
+    command: ["send", "/data/b.bin", "--to", "172.30.119.11",
+              "--port", "5117", "--resume", "--verbose"]
+networks:
+  fsnet:
+    ipam:
+      config:
+        - subnet: 172.30.119.0/24
+
+volumes:
+  recv1-out:
+  recv2-out:
+  recv3-out:

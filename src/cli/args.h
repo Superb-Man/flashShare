@@ -26,6 +26,7 @@ struct Args {
     std::string out_dir = ".";     // output directory for receive
     bool encrypt = false;          // enable encryption
     bool resume = false;           // resume interrupted transfer
+    bool relay = false;            // enable relay mode
     bool accept_all = false;       // auto-accept incoming transfers
     bool verbose = false;          // debug logging
     bool daemon = false;           // run receiver as background daemon

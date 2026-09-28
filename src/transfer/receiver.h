@@ -3,6 +3,7 @@
 #include "net/connection.h"
 #include "net/relay_connection.h"
 #include "net/threadpool.h"
+#include "transfer/relay_forwarder.h"
 #include "cli/progress.h"
 
 #include <atomic>
@@ -64,6 +65,26 @@ private:
     std::mutex relay_assignments_mutex_;
     std::unordered_map<std::string, RelayAssignment> relay_assignments_;
 
+    // Returns the assignment stored for this transfer ID, if this node was
+    // given one by a relay coordinator.
+    bool find_relay_assignment(const std::string& transfer_id,
+                               RelayAssignment& assignment);
+
+    /*
+     * Builds the forwarder for a transfer this node was assigned a downstream
+     * for, and opens the downstream connection before accepting upstream. The
+     * upstream manifest is forwarded under the same transfer ID, so
+     * every node in the chain verifies against the original sender's hashes.
+     *
+     * Returns nullptr when this node is the final node
+     */
+    std::unique_ptr<RelayForwarder> start_relay_forwarder(
+        const TransferRequest& request,
+        const StoredTransfer& transfer,
+        const std::string& upstream_ip,
+        std::string& rejection_reason
+    );
+
     uint64_t register_connection(std::shared_ptr<Connection> connection);
     void unregister_connection(uint64_t connection_id);
     void shutdown_active_connections();
@@ -95,8 +116,17 @@ private:
      * file_progress.durable_bytes is the receiver-confirmed resume offset.
      * It is checkpointed as data is safely written. This function must never
      * truncate the partial file during a resume.
+     * 
+     * IMPORTANT
+     * 
+     * forwarder is null unless this node is a mid-chain relay: a direct
+     * transfer, a fan-out target, and the chain's final node all receive
+     * without forwarding. 
+     * 
+     * When it is set, every written byte is published to
+     * it so the forwarding thread can send that range onward immediately.
      */
-    bool recv_file(Connection& conn, StoredTransfer& transfer, StoredFileProgress& file_progress, bool encrypted, ProgressBar& progress);
+    bool recv_file(Connection& conn, StoredTransfer& transfer, StoredFileProgress& file_progress, bool encrypted, ProgressBar& progress, RelayForwarder* forwarder);
     bool prompt_accept(const std::string& sender_ip, const TransferRequest& req);
 
     bool daemonize();

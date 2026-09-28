@@ -78,6 +78,8 @@ static void print_help() {
         "  --port <n>      Port number (default: 5117)\n"
         "  --out <dir>     Output directory (default: current dir)\n"
         "  --encrypt       Enable AES-256-GCM encryption\n"
+        "  --relay         Chain the --to receivers (S -> R1 -> R2 -> R3) instead\n"
+        "                  of fanning out to each of them from the sender\n"
         "  --resume        Resume an interrupted transfer\n"
         "  --accept-all    Auto-accept incoming transfers (no prompt)\n"
         "  --daemon        Run receiver in background (daemon mode)\n"
@@ -90,6 +92,7 @@ static void print_help() {
         "EXAMPLES:\n"
         "  flashshare send bigfile.iso --to 192.168.1.50\n"
         "  flashshare send bigfile.iso --to 192.168.1.50,192.168.1.51 --resume\n"
+        "  flashshare send bigfile.iso --to 192.168.1.50, 192.168.1.51, 192.168.1.52 --relay\n"
         "  flashshare send ./project/ --to 192.168.1.50 --encrypt\n"
         "  flashshare send a.txt b.txt ./project/ --to 192.168.1.50\n"
         "  flashshare recv --port 5117 --out ~/downloads\n"
@@ -153,6 +156,8 @@ bool parse_args(int argc, char* argv[], Args& args) {
             args.out_dir = argv[++i];
         } else if (arg == "--encrypt") {
             args.encrypt = true;
+        } else if (arg == "--relay") {
+            args.relay = true;
         } else if (arg == "--resume") {
             args.resume = true;
         } else if (arg == "--accept-all") {
@@ -205,6 +210,15 @@ bool parse_args(int argc, char* argv[], Args& args) {
         if (!parse_targets(args.to, args.targets)) {
             return false;
         }
+        if (args.relay && args.encrypt) {
+            fprintf(stderr, "Error: --relay does not support --encrypt yet\n");
+            return false;
+        }
+    }
+
+    if (args.relay && args.command != Command::SEND) {
+        fprintf(stderr, "Error: --relay is only valid for send\n");
+        return false;
     }
 
     return true;
