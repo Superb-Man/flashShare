@@ -41,6 +41,12 @@
 #define GET_ERRNO errno
 #endif
 
+// Implements socket creation, connection, I/O, and endpoint inspection.
+// Transfer sockets use buffer tuning and zero-copy sending; relay setup uses
+// bounded connection and I/O timeouts.
+// It also exposes the peer and local addresses used to identify relay
+// endpoints and to bind rejoin requests after a receiver restart.
+
 namespace flashshare {
 
 // --- Winsock global init/shutdown ---
@@ -300,6 +306,17 @@ bool Socket::set_reuseaddr(bool enable) {
     return true;
 }
 
+std::string Socket::local_address() const {
+    struct sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    if (getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &len) < 0) {
+        return "";
+    }
+    char buf[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf));
+    return std::string(buf);
+}
+
 std::string Socket::peer_address() const {
     struct sockaddr_in addr{};
     socklen_t len = sizeof(addr);
@@ -413,7 +430,7 @@ bool Socket::set_recv_timeout(int sec) {
 
 bool Socket::relay_set_recv_timeout(std::chrono::milliseconds timeout) {
     const auto timeout_ms = timeout.count();
-    if (timeout_ms <= 0) {
+    if (timeout_ms < 0) {
         return false;
     }
 
@@ -435,7 +452,7 @@ bool Socket::set_send_timeout(int sec) {
 
 bool Socket::relay_set_send_timeout(std::chrono::milliseconds timeout) {
     const auto timeout_ms = timeout.count();
-    if (timeout_ms <= 0) {
+    if (timeout_ms < 0) {
         return false;
     }
 

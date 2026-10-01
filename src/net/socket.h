@@ -19,6 +19,12 @@ typedef SSIZE_T ssize_t;
 #include <unistd.h>
 #endif
 
+// Declares the socket wrapper used by data and relay control connections.
+// It owns the native socket and exposes connection, timeout, shutdown,
+// and zero-copy send operations.
+// The wrapper owns the native descriptor and can shut it down to wake
+// a blocked transfer when relay recovery pauses the data stream.
+
 namespace flashshare {
 
 // Winsock global init/shutdown (no-op on Linux)
@@ -73,7 +79,8 @@ public:
     // Set SO_REUSEADDR
     bool set_reuseaddr(bool enable);
 
-    // Get peer address
+    // Get peer and local addresses of a connected socket.
+    std::string local_address() const;
     std::string peer_address() const;
     uint16_t peer_port() const;
 

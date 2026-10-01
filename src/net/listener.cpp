@@ -6,6 +6,13 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
+#include <poll.h>
+
+// Opens a TCP listening socket and accepts incoming connections.
+// Both blocking and deadline-bounded accept paths are used by receiver and
+// relay control listeners.
+// Accepted sockets are handed to their caller for transfer or control
+// handling; the listener itself does not process protocol messages.
 
 namespace flashshare {
 
@@ -33,9 +40,17 @@ bool Listener::start(const std::string& address, uint16_t port, int backlog) {
         return false;
     }
 
-    port_ = port;
+    sockaddr_in bound_address{};
+    socklen_t address_length = sizeof(bound_address);
+    
+    if (getsockname(listen_socket_.fd(), reinterpret_cast<sockaddr*>(&bound_address), &address_length) != 0) {
+        listen_socket_.close();
+        return false;
+    }
+
+    port_ = ntohs(bound_address.sin_port);
     running_ = true;
-    LOG_INFO("Listening on %s:%u", address.empty() ? "0.0.0.0" : address.c_str(), port);
+    LOG_INFO("Listening on %s:%u", address.empty() ? "0.0.0.0" : address.c_str(), port_);
     return true;
 }
 
@@ -49,6 +64,15 @@ Socket Listener::accept_one() {
         LOG_INFO("Connection from %s:%u", client.peer_address().c_str(), client.peer_port());
     }
     return client;
+}
+
+Socket Listener::accept_one_for(std::chrono::milliseconds timeout) {
+    pollfd event{listen_socket_.fd(), POLLIN, 0};
+    if (::poll(&event, 1, static_cast<int>(timeout.count())) <= 0 ||
+        !(event.revents & POLLIN)) {
+        return Socket{};
+    }
+    return accept_one();
 }
 
 void Listener::accept_loop(OnConnectCallback callback) {

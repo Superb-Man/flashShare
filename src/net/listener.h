@@ -1,6 +1,7 @@
 #pragma once
 
 #include "net/socket.h"
+#include <chrono>
 #include <string>
 #include <cstdint>
 #include <functional>
@@ -19,6 +20,7 @@ public:
 
     bool start(const std::string& address, uint16_t port, int backlog = 128);
     Socket accept_one();
+    Socket accept_one_for(std::chrono::milliseconds timeout);
     void accept_loop(OnConnectCallback callback);
     void stop();
 
