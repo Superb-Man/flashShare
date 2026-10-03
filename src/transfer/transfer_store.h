@@ -10,6 +10,12 @@
 #include <unordered_set>
 #include <unordered_map>
 
+// Defines saved transfer and per-file progress records for the receiver.
+// TransferStore loads and updates journals so a reconnecting sender can
+// resume from receiver-confirmed durable offsets.
+// Each file record also retains its reserved final name and partial path,
+// preventing a resumed transfer from allocating a different output file.
+
 namespace flashshare {
 
 struct StoredFileProgress {
@@ -77,6 +83,10 @@ public:
     // Absolute path complete_file() renames a finished file to. A relay node
     // needs it because completing a file removes its .part source.
     std::string final_path(const std::string& sender_public_ip, const StoredFileProgress& file) const;
+
+    // Total receiver-confirmed prefix across manifest files for relay ordering.
+    uint64_t durable_bytes(const std::string& sender_public_ip,
+                           const std::string& transfer_id) const;
 
     // Mark a connection as owning this transfer. False means another live
     // connection already owns it; this prevents concurrent writes to .part files.

@@ -19,6 +19,12 @@
 // Simple storage utility
 // Co authored By - Cline
 
+// Stores receiver journals and file progress across interrupted transfers.
+// It reserves final names, tracks durable byte offsets, and marks verified
+// files and whole transfers complete for safe resumption.
+// A reconnecting sender receives only offsets confirmed by the receiver,
+// avoiding a restart from zero for already stored ranges.
+
 namespace flashshare {
 
 namespace fs = std::filesystem;
@@ -222,6 +228,19 @@ bool TransferStore::load(const std::string& sender_public_ip, const std::string&
     }
 
     return true;
+}
+
+uint64_t TransferStore::durable_bytes(const std::string& sender_public_ip,
+                                      const std::string& transfer_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    StoredTransfer transfer;
+    if (!load(sender_public_ip, transfer_id, transfer)) return 0;
+
+    uint64_t bytes = 0;
+    for (const auto& file : transfer.files) {
+        bytes += file.completed ? file.expected_size : file.durable_bytes;
+    }
+    return bytes;
 }
 
 bool TransferStore::save(const StoredTransfer& transfer) const {
