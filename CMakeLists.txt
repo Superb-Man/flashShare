@@ -37,6 +37,11 @@ add_executable(flashshare
     src/transfer/fanout_sender.cpp
     src/transfer/relay_discovery.cpp
     src/transfer/relay_coordinator.cpp
+    src/transfer/relay_membership.cpp
+    src/transfer/relay_heartbeat.cpp
+    src/transfer/relay_rejoin_listener.cpp
+    src/transfer/relay_recovery.cpp
+    src/transfer/relay_timer.cpp
     src/transfer/relay_forwarder.cpp
 )
 

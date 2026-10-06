@@ -5,7 +5,15 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include "transfer/prepared_manifest.h"
+
+// Declares the single-destination sender and its transfer session.
+// Callers may provide paths or reuse a prepared manifest, and relay recovery
+// can request a stop on the active data connection.
+// The coordinator can reuse the same manifest and transfer ID after a
+// chain rebuild instead of preparing the files again.
 
 namespace flashshare {
 
@@ -29,6 +37,9 @@ public:
 
     // Run the send operation
     int run();
+
+    // Used by the relay coordinator to pause streaming before rebuilding.
+    void request_stop();
 
     const std::string& transfer_id() const {
         return session_.transfer_id;
@@ -68,6 +79,9 @@ private:
     size_t retry_count_ = 0;
     std::uint64_t bytes_sent_ = 0;
     double elapsed_time_ = 0.0;
+    std::atomic<bool> stop_requested_{false};
+    std::mutex active_connection_mutex_;
+    std::shared_ptr<Connection> active_connection_;
 
     // std::string generate_transfer_id();
     // static uint64_t get_file_size(const std::string& path);
@@ -96,7 +110,7 @@ private:
      * then obtains authoritative per-file offsets from the receiver.
      */
     bool connect_and_negotiate(const TransferSession& session,
-                               std::unique_ptr<Connection>& conn,
+                               std::shared_ptr<Connection>& conn,
                                std::vector<uint64_t>& resume_offsets);
 
     /*

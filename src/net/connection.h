@@ -8,6 +8,12 @@
 #include <string>
 #include <vector>
 
+// Defines the framed transfer protocol, including message types, manifests,
+// file headers, and resume responses. Connection sends and receives these
+// messages over a Socket, with optional encryption.
+// The same framing is used when a sender reconnects and asks the receiver
+// for confirmed offsets before sending the remaining file bytes.
+
 namespace flashshare {
 
 class RelayConnection;
@@ -32,7 +38,12 @@ enum class MessageType : uint8_t {
     RELAY_DISCOVERY_RESPONSE = 12,
     RELAY_ASSIGNMENT_REQUEST = 13,
     RELAY_ASSIGNMENT_RESPONSE = 14,
-    TRANSFER_ACK = 15
+    TRANSFER_ACK = 15,
+    RELAY_HEARTBEAT_REQUEST = 16,
+    RELAY_HEARTBEAT_RESPONSE = 17,
+    PLEASE_REQUEST_REJOIN = 18,
+    REJOIN_REQ = 19,
+    REJOIN_ACK = 20
 };
 
 struct FileEntry {

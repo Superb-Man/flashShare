@@ -6,6 +6,12 @@
 #include <stdexcept>
 #include <utility>
 
+// Probes candidate receivers concurrently under a shared discovery deadline.
+// Each response reports availability and saved progress so the coordinator
+// can choose and order nodes for a relay chain.
+// The shared deadline prevents a slow or unreachable candidate from
+// delaying the entire initial chain build.
+
 namespace flashshare {
 
 RelayDiscovery::RelayDiscovery(
@@ -103,6 +109,7 @@ RelayProbeResult RelayDiscovery::probe(
 
     result.responded = true;
     result.available = response.available;
+    result.offset = response.offset;
     result.message = response.message;
     return result;
 }

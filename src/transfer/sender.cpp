@@ -22,6 +22,12 @@
 #include <unistd.h>
 #endif
 
+// Sends a prepared transfer to one destination, including file data and
+// resume negotiation. Direct and fan-out sends retain their retry behavior;
+// a relay send can be stopped before the coordinator rebuilds its chain.
+// For a relay chain it sends one copy into the head node and waits for
+// downstream completion to travel back through the chain.
+
 namespace flashshare {
 
 namespace {
@@ -81,6 +87,16 @@ Sender::Sender(std::shared_ptr<const PreparedManifest> manifest,
     session_.manifest = std::move(manifest);
 }
 
+void Sender::request_stop() {
+    stop_requested_ = true;
+    std::shared_ptr<Connection> connection;
+    {
+        std::lock_guard<std::mutex> lock(active_connection_mutex_);
+        connection = active_connection_;
+    }
+    if (connection) connection->socket().shutdown_both();
+}
+
 // Sends one file from the exact durable byte offset confirmed by the receiver.
 //
 // The sender never assumes that a successful sendfile()/send() call means the
@@ -131,6 +147,7 @@ bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_in
         conn.socket().set_cork(true);
 
         while (sent < file.size) {
+            if (stop_requested_) return false;
             size_t to_send = CHUNK_SIZE;
             if (file.size - sent < CHUNK_SIZE) {
                 to_send = static_cast<size_t>(file.size - sent);
@@ -231,7 +248,7 @@ bool Sender::send_file(Connection& conn, const FileEntry& file, uint32_t file_in
 // Opens a new TCP connection and asks the receiver for its durable offsets.
 // Direct and fan-out retries reuse the same transfer ID and manifest so the
 // receiver can find the correct recovery journal.
-bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_ptr<Connection>& conn, std::vector<uint64_t>& resume_offsets) {
+bool Sender::connect_and_negotiate(const TransferSession& session, std::shared_ptr<Connection>& conn, std::vector<uint64_t>& resume_offsets) {
     conn.reset();
     resume_offsets.clear();
 
@@ -245,7 +262,7 @@ bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_p
     socket.set_buffer_size(4 * 1024 * 1024, 4 * 1024 * 1024);
 
     const bool connected = relay_chain_
-        ? socket.relay_connect_blocking(target_ip_, port_)
+        ? socket.relay_connect(target_ip_, port_, std::chrono::seconds(2))
         : socket.connect(target_ip_, port_, 10);
     if (!connected) {
         LOG_ERROR("Cannot connect to receiver %s:%u",
@@ -261,7 +278,15 @@ bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_p
     socket.set_nodelay(true);
     socket.set_cork(true);
 
-    auto candidate = std::make_unique<Connection>(std::move(socket));
+    auto candidate = std::make_shared<Connection>(std::move(socket));
+    {
+        std::lock_guard<std::mutex> lock(active_connection_mutex_);
+        active_connection_ = candidate;
+    }
+    if (stop_requested_) {
+        candidate->socket().shutdown_both();
+        return false;
+    }
 
     TransferRequest request;
     request.version = PROTOCOL_VERSION;
@@ -310,7 +335,7 @@ bool Sender::connect_and_negotiate(const TransferSession& session, std::unique_p
     }
 
     resume_offsets = std::move(response.resume_offsets);
-    conn = std::move(candidate);
+    conn = candidate;
 
     LOG_INFO("Connected to receiver %s:%u for transfer %s", target_ip_.c_str(), port_, session.transfer_id.c_str());
 
@@ -330,8 +355,11 @@ bool Sender::wait_before_retry(unsigned int failed_attempt) const {
 
     LOG_WARN("[%s:%u] Connection interrupted; retrying in %u second(s)",
              target_ip_.c_str(), port_, seconds);
-    std::this_thread::sleep_for(std::chrono::seconds(seconds));
-    return true;
+    for (unsigned int i = 0; i < seconds * 10; ++i) {
+        if (stop_requested_) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return !stop_requested_;
 }
 
 // Sends one complete protocol attempt on one TCP connection.
@@ -449,14 +477,19 @@ int Sender::run() {
         unsigned int failed_attempts = 0;
 
         for (;;) {
+            if (stop_requested_) return finish(1);
             last_error_.clear();
-            std::unique_ptr<Connection> conn;
+            std::shared_ptr<Connection> conn;
             std::vector<uint64_t> resume_offsets;
 
             const bool connected = connect_and_negotiate(session_, conn, resume_offsets);
             const bool transferred = connected && send_attempt(session_, *conn, resume_offsets);
 
-            // Close the failed connection before waiting to reconnect.
+            // Close the connection before waiting or rebuilding.
+            {
+                std::lock_guard<std::mutex> lock(active_connection_mutex_);
+                active_connection_.reset();
+            }
             conn.reset();
 
             if (transferred) {
