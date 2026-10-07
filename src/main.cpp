@@ -5,13 +5,22 @@
 #include "transfer/receiver.h"
 #include "transfer/relay_coordinator.h"
 #include "transfer/relay_plan.h"
+#include "transfer/relay_membership.h"
+#include "transfer/relay_recovery.h"
 #include "net/socket.h"
 #include <signal.h>
 
+#include <chrono>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
+
+// Parses command-line options and selects receiver, direct sender, fan-out,
+// or relay mode. It validates the requested operation before starting any
+// network work. Relay mode discovers responsive destinations, assigns their
+// chain, and runs the sender with coordinator-managed recovery.
 
 using namespace flashshare;
 
@@ -38,9 +47,24 @@ int run_relay_send(const Args& args) {
         return 1;
     }
 
+    std::shared_ptr<RelayMembership> membership;
+    if (plan.is_chain()) {
+        membership = std::make_shared<RelayMembership>(
+            plan.transfer_id, plan.nodes, std::chrono::seconds(2));
+        if (!coordinator.start_rejoin_listener(membership)) {
+            LOG_ERROR("Cannot start relay rejoin listener");
+            return 1;
+        }
+    }
+
     if (!coordinator.assign_plan(plan)) {
         LOG_ERROR("Cannot start relay transfer: %s",
                   coordinator.last_error().c_str());
+        return 1;
+    }
+
+    if (membership && !membership->activate(plan, RelayMembership::Clock::now())) {
+        LOG_ERROR("Cannot activate relay membership");
         return 1;
     }
 
@@ -51,18 +75,14 @@ int run_relay_send(const Args& args) {
     LOG_INFO("Relay chain for transfer %s: sender%s",
              plan.transfer_id.c_str(), chain.c_str());
 
+    if (membership) {
+        RelayRecovery recovery(coordinator, membership, plan);
+        return recovery.run();
+    }
+
     const RelayEndpoint& head = plan.nodes.front();
-
-    Sender sender(
-        coordinator.manifest(),
-        head.address,
-        head.port,
-        args.encrypt,
-        args.resume,
-        true,
-        plan.transfer_id,
-        plan.is_chain());
-
+    Sender sender(coordinator.manifest(), head.address, head.port,
+                  args.encrypt, args.resume, true, plan.transfer_id, false);
     return sender.run();
 }
 

@@ -7,12 +7,20 @@
 #include "cli/progress.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+// Declares receiver state and handlers for transfer and relay messages.
+// Worker threads handle accepted connections while saved journals and relay
+// assignments preserve recovery information across reconnects.
+// It tracks accepted sockets for shutdown and retains assignment details
+// needed to reconnect to the coordinator after restart.
 
 namespace flashshare {
 
@@ -54,16 +62,34 @@ private:
 
     struct RelayAssignment {
         std::string coordinator_ip;
+        std::string receiver_ip;
         std::string discovery_id;
+        uint64_t epoch = 0;
         uint64_t total_size = 0;
         uint32_t file_count = 0;
+        uint16_t coordinator_rejoin_port = 0;
         bool has_downstream = false;
         std::string downstream_address;
         uint16_t downstream_port = DEFAULT_PORT;
     };
 
+    std::string relay_assignment_path(const std::string& transfer_id) const;
+    bool save_relay_assignment(const std::string& transfer_id,
+                               const RelayAssignment& assignment) const;
+    void load_relay_assignments();
+    void remove_relay_assignment(const std::string& transfer_id) const;
+    bool request_rejoin(const std::string& transfer_id,
+                        const RelayAssignment& assignment) const;
+    void queue_rejoin(const std::string& transfer_id,
+                      const RelayAssignment& assignment);
+    void rejoin_loop();
+
     std::mutex relay_assignments_mutex_;
     std::unordered_map<std::string, RelayAssignment> relay_assignments_;
+    std::mutex rejoin_mutex_;
+    std::condition_variable rejoin_changed_;
+    std::unordered_map<std::string, RelayAssignment> rejoin_pending_;
+    std::thread rejoin_worker_;
 
     // Returns the assignment stored for this transfer ID, if this node was
     // given one by a relay coordinator.
@@ -98,6 +124,12 @@ private:
         const RelayDiscoveryRequest& request
     );
 
+    int handle_relay_heartbeat(
+        Connection& conn,
+        RelayConnection& relay_connection,
+        const RelayHeartbeatRequest& request
+    );
+
     // This is post relay discovery action
     int handle_relay_assignment(
         Connection& conn,
@@ -106,6 +138,7 @@ private:
     );
     bool store_relay_assignment(
         const std::string& coordinator_ip,
+        const std::string& receiver_ip,
         const RelayAssignmentRequest& request,
         std::string& rejection_reason
     );

@@ -15,6 +15,12 @@
 #include <unistd.h>
 #endif
 
+// Streams bytes already stored by a relay receiver to its downstream node.
+// It waits for newly received ranges, forwards them on one data connection,
+// and passes downstream completion back upstream.
+// Publishing a newly stored range wakes the forwarder, so it can send
+// live data without waiting for the whole file to arrive.
+
 namespace flashshare {
 
 RelayForwarder::RelayForwarder(std::string downstream_address,
@@ -69,13 +75,16 @@ bool RelayForwarder::start() {
 
     socket.set_buffer_size(4 * 1024 * 1024, 4 * 1024 * 1024);
 
-    if (!socket.relay_connect_blocking(downstream_address_, downstream_port_)) {
+    if (!socket.relay_connect(downstream_address_, downstream_port_,
+                              std::chrono::seconds(2))) {
         fail("Cannot connect to downstream relay node " + downstream_address_);
         return false;
     }
 
     socket.set_nodelay(true);
     socket.set_cork(true);
+    socket.relay_set_send_timeout(std::chrono::seconds(2));
+    socket.relay_set_recv_timeout(std::chrono::seconds(2));
 
     auto downstream = std::make_unique<Connection>(std::move(socket));
 
@@ -115,6 +124,8 @@ bool RelayForwarder::start() {
     }
 
     downstream_offsets_ = std::move(response.resume_offsets);
+    downstream->socket().relay_set_send_timeout(std::chrono::milliseconds(0));
+    downstream->socket().relay_set_recv_timeout(std::chrono::milliseconds(0));
     downstream_ = std::move(downstream);
 
     LOG_INFO("Relaying transfer %s downstream to %s:%u",
@@ -193,6 +204,9 @@ void RelayForwarder::abort() {
         aborted_ = true;
     }
     data_available_.notify_all();
+    // A rebuilding upstream must also wake a forwarding worker blocked in
+    // downstream sendfile() or waiting for its completion acknowledgement.
+    if (downstream_) downstream_->socket().shutdown_both();
 }
 
 // Forwards one file, following its .part as the receive thread grows it.
@@ -259,8 +273,7 @@ bool RelayForwarder::forward_file(const RelayFileFlow& file,
                 std::min<uint64_t>(CHUNK_SIZE, available - sent));
 
             off_t source_offset = static_cast<off_t>(sent);
-            ssize_t n = downstream_->socket().sendfile(
-                source_fd, &source_offset, to_send);
+            ssize_t n = downstream_->socket().sendfile(source_fd, &source_offset, to_send);
 
             if (n < 0) {
                 if (errno == EINTR) continue;

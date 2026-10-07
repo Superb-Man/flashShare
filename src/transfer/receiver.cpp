@@ -11,6 +11,10 @@
 #include <cstdio>
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <utility>
 
 #ifdef _WIN32
 #include <io.h>
@@ -22,6 +26,12 @@ typedef int mode_t;
 #include <signal.h>
 #include <sys/wait.h>
 #endif
+
+// Accepts concurrent file transfers and relay control requests.
+// TransferStore journals durable progress for resume; assigned relay nodes
+// can forward data downstream and request rejoin after restart.
+// Each accepted data connection runs on a worker; relay rejoin retries run
+// separately so they do not occupy a file-transfer worker.
 
 namespace flashshare {
 
@@ -44,6 +54,8 @@ Receiver::Receiver(uint16_t port, const std::string& out_dir, bool accept_all, b
 
 Receiver::~Receiver() {
     stop();
+    rejoin_changed_.notify_all();
+    if (rejoin_worker_.joinable()) rejoin_worker_.join();
     if (thread_pool_) {
         thread_pool_->stop(false);
     }
@@ -379,8 +391,23 @@ int Receiver::handle_relay_discovery(
     } else if (request.file_count == 0) {
         response.message = "relay transfer contains no files";
     } else {
-        response.available = true;
-        response.message = "available";
+        RelayAssignment assignment;
+        if (!request.transfer_id.empty() &&
+            find_relay_assignment(request.transfer_id, assignment)) {
+            if (assignment.coordinator_ip != conn.socket().peer_address() ||
+                assignment.total_size != request.total_size ||
+                assignment.file_count != request.file_count) {
+                response.message = "relay transfer identity does not match";
+            } else {
+                response.available = true;
+                response.offset = transfer_store_->durable_bytes(
+                    assignment.coordinator_ip, request.transfer_id);
+                response.message = "available";
+            }
+        } else {
+            response.available = true;
+            response.message = "available";
+        }
     }
 
     // Discovery is a small control exchange. Flush its response immediately
@@ -413,8 +440,194 @@ int Receiver::handle_relay_discovery(
     return 0;
 }
 
+std::string Receiver::relay_assignment_path(const std::string& transfer_id) const {
+    const auto* bytes = reinterpret_cast<const uint8_t*>(transfer_id.data());
+    const std::string key = SHA256::buffer_hash(bytes, transfer_id.size());
+    return (std::filesystem::path(out_dir_) / ".flashshare" /
+            "relay_assignments" / (key + ".state")).string();
+}
+
+bool Receiver::save_relay_assignment(
+    const std::string& transfer_id,
+    const RelayAssignment& assignment
+) const {
+    namespace fs = std::filesystem;
+    const std::string path = relay_assignment_path(transfer_id);
+    const std::string temporary = path + ".tmp";
+    std::error_code error;
+    fs::create_directories(fs::path(path).parent_path(), error);
+    if (error) return false;
+
+    {
+        std::ofstream out(temporary, std::ios::trunc);
+        if (!out) return false;
+        out << "FLASHSHARE_RELAY_ASSIGNMENT_V2\n"
+            << std::quoted(transfer_id) << '\n'
+            << std::quoted(assignment.coordinator_ip) << '\n'
+            << std::quoted(assignment.receiver_ip) << '\n'
+            << std::quoted(assignment.discovery_id) << '\n'
+            << assignment.epoch << ' ' << assignment.total_size << ' '
+            << assignment.file_count << ' '
+            << assignment.coordinator_rejoin_port << ' '
+            << assignment.has_downstream << ' '
+            << assignment.downstream_port << '\n'
+            << std::quoted(assignment.downstream_address) << '\n';
+        out.flush();
+        if (!out) return false;
+    }
+
+#ifndef _WIN32
+    const int fd = ::open(temporary.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    const bool synced = ::fsync(fd) == 0;
+    ::close(fd);
+    if (!synced) return false;
+#endif
+
+    fs::rename(temporary, path, error);
+    return !error;
+}
+
+void Receiver::load_relay_assignments() {
+    namespace fs = std::filesystem;
+    const fs::path directory = fs::path(out_dir_) / ".flashshare" / "relay_assignments";
+    std::error_code error;
+    if (!fs::exists(directory, error)) return;
+    for (const auto& entry : fs::directory_iterator(directory, error)) {
+        if (error) break;
+        if (!entry.is_regular_file() || entry.path().extension() != ".state") continue;
+
+        std::ifstream in(entry.path());
+        std::string format;
+        std::string transfer_id;
+        RelayAssignment assignment;
+        unsigned int rejoin_port = 0;
+        unsigned int downstream_port = 0;
+        if (!std::getline(in, format) ||
+            (format != "FLASHSHARE_RELAY_ASSIGNMENT_V1" &&
+             format != "FLASHSHARE_RELAY_ASSIGNMENT_V2") ||
+            !(in >> std::quoted(transfer_id)
+                 >> std::quoted(assignment.coordinator_ip)) ||
+            (format == "FLASHSHARE_RELAY_ASSIGNMENT_V2" &&
+             !(in >> std::quoted(assignment.receiver_ip))) ||
+            !(in >> std::quoted(assignment.discovery_id)
+                 >> assignment.epoch >> assignment.total_size
+                 >> assignment.file_count >> rejoin_port
+                 >> assignment.has_downstream >> downstream_port
+                 >> std::quoted(assignment.downstream_address)) ||
+            transfer_id.empty() || assignment.coordinator_ip.empty() ||
+            assignment.discovery_id.empty() || assignment.file_count == 0 ||
+            rejoin_port == 0 || rejoin_port > UINT16_MAX ||
+            downstream_port > UINT16_MAX ||
+            entry.path() != relay_assignment_path(transfer_id)) {
+            LOG_WARN("Ignoring invalid relay assignment record %s",
+                     entry.path().c_str());
+            continue;
+        }
+        assignment.coordinator_rejoin_port = static_cast<uint16_t>(rejoin_port);
+        assignment.downstream_port = static_cast<uint16_t>(downstream_port);
+        relay_assignments_.emplace(std::move(transfer_id), std::move(assignment));
+    }
+}
+
+void Receiver::remove_relay_assignment(const std::string& transfer_id) const {
+    std::error_code error;
+    std::filesystem::remove(relay_assignment_path(transfer_id), error);
+    if (error) LOG_WARN("Cannot remove completed relay assignment: %s", error.message().c_str());
+}
+
+bool Receiver::request_rejoin(
+    const std::string& transfer_id,
+    const RelayAssignment& assignment
+) const {
+    Socket socket;
+    if (!socket.create()) return false;
+    if (!assignment.receiver_ip.empty() &&
+        !socket.bind(assignment.receiver_ip, 0)) {
+        LOG_WARN("Cannot bind relay rejoin request to %s", assignment.receiver_ip.c_str());
+        return false;
+    }
+    if (!socket.relay_connect(assignment.coordinator_ip,
+                              assignment.coordinator_rejoin_port,
+                              std::chrono::seconds(2))) {
+        LOG_WARN("Cannot request relay rejoin for transfer %s", transfer_id.c_str());
+        return false;
+    }
+
+    socket.relay_set_send_timeout(std::chrono::seconds(2));
+    socket.relay_set_recv_timeout(std::chrono::seconds(2));
+
+    Connection connection(std::move(socket));
+
+    RelayConnection relay_connection(connection);
+    RelayRejoinMessage request;
+
+    request.transfer_id = transfer_id;
+    request.epoch = assignment.epoch;
+
+    RelayRejoinMessage acknowledgement;
+
+    if (!relay_connection.send_rejoin_request(request) ||
+        !relay_connection.recv_rejoin_ack(acknowledgement) ||
+        acknowledgement.transfer_id != transfer_id ||
+        acknowledgement.epoch != assignment.epoch) {
+        LOG_WARN("Relay rejoin was not acknowledged for transfer %s", transfer_id.c_str());
+        return false;
+    }
+    LOG_INFO("Relay rejoin accepted for transfer %s", transfer_id.c_str());
+    return true;
+}
+
+void Receiver::queue_rejoin(const std::string& transfer_id,
+                            const RelayAssignment& assignment) {
+    if (assignment.coordinator_rejoin_port == 0) return;
+    {
+        std::lock_guard<std::mutex> lock(rejoin_mutex_);
+        rejoin_pending_[transfer_id] = assignment;
+    }
+    rejoin_changed_.notify_one();
+}
+
+void Receiver::rejoin_loop() {
+    while (running_) {
+        std::unordered_map<std::string, RelayAssignment> pending;
+        {
+            std::unique_lock<std::mutex> lock(rejoin_mutex_);
+            rejoin_changed_.wait(lock, [&] {
+                return !running_ || !rejoin_pending_.empty();
+            });
+            if (!running_) break;
+            pending = rejoin_pending_;
+        }
+
+        for (const auto& entry : pending) {
+            if (!running_) break;
+            {
+                std::lock_guard<std::mutex> lock(rejoin_mutex_);
+                const auto current = rejoin_pending_.find(entry.first);
+                if (current == rejoin_pending_.end() ||
+                    current->second.epoch != entry.second.epoch) continue;
+            }
+            if (request_rejoin(entry.first, entry.second)) {
+                std::lock_guard<std::mutex> lock(rejoin_mutex_);
+                const auto current = rejoin_pending_.find(entry.first);
+                if (current != rejoin_pending_.end() &&
+                    current->second.epoch == entry.second.epoch) {
+                    rejoin_pending_.erase(current);
+                }
+            }
+        }
+
+        std::unique_lock<std::mutex> lock(rejoin_mutex_);
+        rejoin_changed_.wait_for(lock, std::chrono::seconds(2), [&] {
+            return !running_ || rejoin_pending_.size() > pending.size();
+        });
+    }
+}
+
 bool Receiver::store_relay_assignment(
     const std::string& coordinator_ip,
+    const std::string& receiver_ip,
     const RelayAssignmentRequest& request,
     std::string& rejection_reason
 ) {
@@ -426,9 +639,12 @@ bool Receiver::store_relay_assignment(
         const RelayAssignment& existing = assigned->second;
         const bool same_assignment =
             existing.coordinator_ip == coordinator_ip &&
+            existing.receiver_ip == receiver_ip &&
             existing.discovery_id == request.discovery_id &&
+            existing.epoch == request.epoch &&
             existing.total_size == request.total_size &&
             existing.file_count == request.file_count &&
+            existing.coordinator_rejoin_port == request.coordinator_rejoin_port &&
             existing.has_downstream == request.has_downstream &&
             existing.downstream_address == request.downstream_address &&
             existing.downstream_port == request.downstream_port;
@@ -437,8 +653,14 @@ bool Receiver::store_relay_assignment(
             return true;
         }
 
-        rejection_reason = "transfer ID conflicts with an existing relay assignment";
-        return false;
+        if (existing.coordinator_ip != coordinator_ip ||
+            existing.total_size != request.total_size ||
+            existing.file_count != request.file_count ||
+            existing.coordinator_rejoin_port != request.coordinator_rejoin_port ||
+            request.epoch <= existing.epoch) {
+            rejection_reason = "transfer ID conflicts with an existing relay assignment";
+            return false;
+        }
     }
 
     if (!request.has_downstream && !request.downstream_address.empty()) {
@@ -448,14 +670,27 @@ bool Receiver::store_relay_assignment(
 
     RelayAssignment assignment;
     assignment.coordinator_ip = coordinator_ip;
+    assignment.receiver_ip = receiver_ip;
     assignment.discovery_id = request.discovery_id;
+    assignment.epoch = request.epoch;
     assignment.total_size = request.total_size;
     assignment.file_count = request.file_count;
+    assignment.coordinator_rejoin_port = request.coordinator_rejoin_port;
     assignment.has_downstream = request.has_downstream;
     assignment.downstream_address = request.downstream_address;
     assignment.downstream_port = request.downstream_port;
 
-    relay_assignments_.emplace(request.transfer_id, std::move(assignment));
+    if (assignment.coordinator_rejoin_port != 0 &&
+        !save_relay_assignment(request.transfer_id, assignment)) {
+        rejection_reason = "cannot persist relay rejoin assignment";
+        return false;
+    }
+
+    relay_assignments_[request.transfer_id] = std::move(assignment);
+    {
+        std::lock_guard<std::mutex> rejoin_lock(rejoin_mutex_);
+        rejoin_pending_.erase(request.transfer_id);
+    }
     return true;
 }
 
@@ -467,12 +702,14 @@ int Receiver::handle_relay_assignment(
     RelayAssignmentResponse response;
     response.discovery_id = request.discovery_id;
     response.transfer_id = request.transfer_id;
+    response.epoch = request.epoch;
 
     if (request.version != PROTOCOL_VERSION) {
         response.message = "protocol version mismatch";
     } else {
         response.accepted = store_relay_assignment(
             conn.socket().peer_address(),
+            conn.socket().local_address(),
             request,
             response.message
         );
@@ -516,6 +753,30 @@ int Receiver::handle_relay_assignment(
     }
 
     return response.accepted ? 0 : 1;
+}
+
+int Receiver::handle_relay_heartbeat(
+    Connection& conn,
+    RelayConnection& relay_connection,
+    const RelayHeartbeatRequest& request
+) {
+    RelayHeartbeatResponse response;
+    response.transfer_id = request.transfer_id;
+    response.epoch = request.epoch;
+
+    RelayAssignment assignment;
+    response.alive = request.version == PROTOCOL_VERSION &&
+                     find_relay_assignment(request.transfer_id, assignment) &&
+                     assignment.epoch == request.epoch &&
+                     assignment.coordinator_ip == conn.socket().peer_address();
+
+    conn.socket().set_cork(false);
+
+    if (!relay_connection.send_heartbeat_response(response)) {
+        LOG_ERROR("Failed to send relay heartbeat response for %s", request.transfer_id.c_str());
+        return 1;
+    }
+    return 0;
 }
 
 bool Receiver::find_relay_assignment(const std::string& transfer_id, RelayAssignment& assignment) {
@@ -592,7 +853,8 @@ std::unique_ptr<RelayForwarder> Receiver::start_relay_forwarder(
 // 1. Read the first framed message once.
 // 2. RELAY_DISCOVERY_REQUEST reports whether this receiver is available.
 // 3. RELAY_ASSIGNMENT_REQUEST stores this receiver's downstream role.
-// 4. TRANSFER_REQUEST continues through the existing file-transfer flow.
+// 4. RELAY_HEARTBEAT_REQUEST checks the stored relay assignment.
+// 5. TRANSFER_REQUEST continues through the existing file-transfer flow.
 //
 // Transfer recovery identity:
 // - peer_address() selects the receiver output directory:
@@ -625,13 +887,17 @@ int Receiver::handle_connection(Connection& conn) {
     TransferRequest req{};
     RelayDiscoveryRequest discovery_request;
     RelayAssignmentRequest assignment_request;
+    RelayHeartbeatRequest heartbeat_request;
+    RelayRejoinMessage rejoin_hint;
     RelayConnection relay_connection(conn);
 
     if (!relay_connection.recv_initial_request(
             initial_type,
             req,
             discovery_request,
-            assignment_request)) {
+            assignment_request,
+            heartbeat_request,
+            rejoin_hint)) {
         LOG_ERROR("Failed to receive initial request");
         return 1;
     }
@@ -652,6 +918,20 @@ int Receiver::handle_connection(Connection& conn) {
         );
     }
 
+    if (initial_type == MessageType::RELAY_HEARTBEAT_REQUEST) {
+        return handle_relay_heartbeat(conn, relay_connection, heartbeat_request);
+    }
+
+    if (initial_type == MessageType::PLEASE_REQUEST_REJOIN) {
+        RelayAssignment assignment;
+        if (!find_relay_assignment(rejoin_hint.transfer_id, assignment) ||
+            assignment.coordinator_ip != conn.socket().peer_address() ||
+            assignment.coordinator_rejoin_port == 0) return 1;
+
+        queue_rejoin(rejoin_hint.transfer_id, assignment);
+        return 0;
+    }
+
     if (initial_type != MessageType::TRANSFER_REQUEST) {
         LOG_ERROR(
             "Unsupported initial request type: %d",
@@ -660,7 +940,7 @@ int Receiver::handle_connection(Connection& conn) {
         return 1;
     }
 
-    const std::string sender_public_ip = conn.socket().peer_address();
+    std::string sender_public_ip = conn.socket().peer_address();
 
     auto reject = [&](const std::string& reason) {
         LOG_ERROR("Rejecting transfer %s: %s",
@@ -694,6 +974,9 @@ int Receiver::handle_connection(Connection& conn) {
             assignment.total_size != req.total_size) {
             return reject("missing or mismatched relay-chain assignment");
         }
+        // The upstream relay can change after a rebuild. Keep the recovery
+        // journal under the original coordinator's directory on every hop.
+        sender_public_ip = assignment.coordinator_ip;
     }
 
     // A first connection still needs user approval. With --accept-all this
@@ -854,6 +1137,7 @@ int Receiver::handle_connection(Connection& conn) {
             return 1;
         }
         conn.socket().set_cork(false);
+        remove_relay_assignment(stored_transfer->transfer_id);
     }
 
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - overall_start).count();
@@ -891,6 +1175,7 @@ int Receiver::run() {
     }
 
     transfer_store_ = std::make_unique<TransferStore>(out_dir_);
+    load_relay_assignments();
 
     // Daemonize if requested
     if (daemon_) {
@@ -939,6 +1224,11 @@ int Receiver::run() {
     // Create workers only after daemonization: forking with live threads is unsafe.
     thread_pool_ = std::make_unique<ThreadPool>();
     running_ = true;
+    {
+        std::lock_guard<std::mutex> lock(rejoin_mutex_);
+        rejoin_pending_ = relay_assignments_;
+    }
+    rejoin_worker_ = std::thread(&Receiver::rejoin_loop, this);
     LOG_INFO("Waiting for incoming connections... (Ctrl+C to stop)");
 
     // Main accept loop — handles concurrent transfers
@@ -966,6 +1256,8 @@ int Receiver::run() {
     }
 
     listener.stop();
+    rejoin_changed_.notify_all();
+    if (rejoin_worker_.joinable()) rejoin_worker_.join();
     if (thread_pool_) {
         thread_pool_->stop(true);
     }
