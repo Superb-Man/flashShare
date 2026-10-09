@@ -488,6 +488,34 @@ bool Receiver::save_relay_assignment(
     return !error;
 }
 
+void Receiver::register_active_transfer(const std::string& transfer_id, Connection* connection) {
+    std::lock_guard<std::mutex> lock(active_transfers_mutex_);
+    active_transfers_[transfer_id] = connection;
+}
+
+void Receiver::unregister_active_transfer(const std::string& transfer_id) {
+    std::lock_guard<std::mutex> lock(active_transfers_mutex_);
+    active_transfers_.erase(transfer_id);
+}
+
+void Receiver::preempt_active_transfer(const std::string& transfer_id) {
+    Connection* state = nullptr; 
+    {
+        std::lock_guard<std::mutex> lock(active_transfers_mutex_);
+        auto it = active_transfers_.find(transfer_id);
+        if (it != active_transfers_.end()) {
+            state = it->second;
+        }
+    }
+
+    if (state) {
+        // shutdown_block is a blocking operation that will close both read and write channels
+        // of the socket, effectively preempting the transfer.
+        // exit and release the transfer session
+        state->socket().shutdown_both();
+    }
+}
+
 void Receiver::load_relay_assignments() {
     namespace fs = std::filesystem;
     const fs::path directory = fs::path(out_dir_) / ".flashshare" / "relay_assignments";
@@ -685,6 +713,13 @@ bool Receiver::store_relay_assignment(
         rejection_reason = "cannot persist relay rejoin assignment";
         return false;
     }
+
+    // If relay assignment mismatches
+    // preempt the active transfer 
+    if (assigned != relay_assignments_.end()) {
+        preempt_active_transfer(request.transfer_id);
+    }
+
 
     relay_assignments_[request.transfer_id] = std::move(assignment);
     {
@@ -996,24 +1031,65 @@ int Receiver::handle_connection(Connection& conn) {
         return reject("cannot create or validate transfer recovery state");
     }
 
-    if (!transfer_store_->acquire_session(
-            sender_public_ip, stored_transfer->transfer_id)) {
-        return reject("this transfer is already active");
+    if (!transfer_store_->acquire_session(sender_public_ip, stored_transfer->transfer_id)) {
+
+        // A previous data connection for this transfer may still be alive
+        // Force close it so that
+        // old worker exits and releases the session and retry
+        preempt_active_transfer(stored_transfer->transfer_id);
+
+        bool acquired = false;
+
+        for (int i = 0; i < 50; i++) {
+            if (transfer_store_->acquire_session(sender_public_ip, stored_transfer->transfer_id)) {
+                acquired = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (!acquired) {
+            return reject("this transfer is already active");
+        }
     }
+
+    register_active_transfer(stored_transfer->transfer_id, &conn);
 
     struct SessionRelease {
         TransferStore* store;
+        Receiver* receiver;
         std::string sender_ip;
         std::string transfer_id;
 
         ~SessionRelease() {
+            receiver->unregister_active_transfer(transfer_id);
             store->release_session(sender_ip, transfer_id);
         }
     } release{
         transfer_store_.get(),
+        this,
         sender_public_ip,
         stored_transfer->transfer_id
     };
+
+    // When a relay connection breaks through network error
+    // The reciver should restart the process and send rejoin_request
+    // while trying to join the relay chain it was in.
+    struct RejoinedGuard {
+        Receiver* receiver;
+        std::string transfer_id;
+        bool succeeded = false;
+
+        ~RejoinedGuard() {
+            if (succeeded) return;
+            
+            RelayAssignment assignment;
+            if (receiver->find_relay_assignment(transfer_id, assignment)) {
+                LOG_INFO("Rejoining relay for transfer %s", transfer_id.c_str());
+                receiver->queue_rejoin(transfer_id, assignment);
+            }
+        }
+    } rejoin_guard{this, stored_transfer->transfer_id};
 
     // A relay node must have its downstream node running before it accepts
     // upstream, so a chain that cannot be formed fails before any bytes move.
@@ -1131,6 +1207,8 @@ int Receiver::handle_connection(Connection& conn) {
         return 1;
     }
 
+    remove_relay_assignment(stored_transfer->transfer_id);
+
     if (req.completion_ack) {
         if (!conn.send_message(MessageType::TRANSFER_ACK)) {
             LOG_ERROR("Could not acknowledge relay-chain completion upstream");
@@ -1143,6 +1221,8 @@ int Receiver::handle_connection(Connection& conn) {
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - overall_start).count();
 
     LOG_INFO("Transfer complete: %s (%.1fs)", stored_transfer->transfer_id.c_str(), elapsed);
+
+    rejoin_guard.succeeded = true;
 
     return 0;
 }

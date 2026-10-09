@@ -60,6 +60,11 @@ private:
     std::unordered_map<uint64_t, std::shared_ptr<Connection>> active_connections_;
     uint64_t next_connection_id_ = 1;
 
+
+    // Active transfers is maintained for the case of network error
+    std::mutex active_transfers_mutex_;
+    std::unordered_map<std::string, Connection*> active_transfers_;
+
     struct RelayAssignment {
         std::string coordinator_ip;
         std::string receiver_ip;
@@ -76,6 +81,12 @@ private:
     std::string relay_assignment_path(const std::string& transfer_id) const;
     bool save_relay_assignment(const std::string& transfer_id,
                                const RelayAssignment& assignment) const;
+
+    // For non-blocking relay transfer continuty
+    void register_active_transfer(const std::string& transfer_id, Connection* connection);
+    void unregister_active_transfer(const std::string& transfer_id);
+    void preempt_active_transfer(const std::string& transfer_id);
+
     void load_relay_assignments();
     void remove_relay_assignment(const std::string& transfer_id) const;
     bool request_rejoin(const std::string& transfer_id,
