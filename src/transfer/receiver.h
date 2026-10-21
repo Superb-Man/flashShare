@@ -88,7 +88,7 @@ private:
     void preempt_active_transfer(const std::string& transfer_id);
 
     void load_relay_assignments();
-    void remove_relay_assignment(const std::string& transfer_id) const;
+    void remove_relay_assignment(const std::string& transfer_id);
     bool request_rejoin(const std::string& transfer_id,
                         const RelayAssignment& assignment) const;
     void queue_rejoin(const std::string& transfer_id,
