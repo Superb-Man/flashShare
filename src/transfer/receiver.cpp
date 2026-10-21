@@ -619,10 +619,17 @@ void Receiver::load_relay_assignments() {
     }
 }
 
-void Receiver::remove_relay_assignment(const std::string& transfer_id) const {
+void Receiver::remove_relay_assignment(const std::string& transfer_id) {
+    std::lock_guard<std::mutex> assignment_lock(relay_assignments_mutex_);
     std::error_code error;
     std::filesystem::remove(relay_assignment_path(transfer_id), error);
     if (error) LOG_WARN("Cannot remove completed relay assignment: %s", error.message().c_str());
+
+    relay_assignments_.erase(transfer_id);
+    {
+        std::lock_guard<std::mutex> rejoin_lock(rejoin_mutex_);
+        rejoin_pending_.erase(transfer_id);
+    }
 }
 
 bool Receiver::request_rejoin(
@@ -671,7 +678,12 @@ void Receiver::queue_rejoin(const std::string& transfer_id,
                             const RelayAssignment& assignment) {
     if (assignment.coordinator_rejoin_port == 0) return;
     {
-        std::lock_guard<std::mutex> lock(rejoin_mutex_);
+        std::lock_guard<std::mutex> assignment_lock(relay_assignments_mutex_);
+        const auto current = relay_assignments_.find(transfer_id);
+        if (current == relay_assignments_.end() ||
+            current->second.epoch != assignment.epoch) return;
+
+        std::lock_guard<std::mutex> rejoin_lock(rejoin_mutex_);
         rejoin_pending_[transfer_id] = assignment;
     }
     rejoin_changed_.notify_one();
@@ -1276,7 +1288,6 @@ int Receiver::handle_connection(Connection& conn) {
             return 1;
         }
         conn.socket().set_cork(false);
-        remove_relay_assignment(stored_transfer->transfer_id);
     }
 
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - overall_start).count();
