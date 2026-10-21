@@ -50,6 +50,10 @@ target_include_directories(flashshare PRIVATE src)
 
 target_link_libraries(flashshare PRIVATE
     ${OPENSSL_CRYPTO_LIBRARY}
+    -l:libjitterentropy.a
+    z
+    zstd
+    ${CMAKE_DL_LIBS}
     Threads::Threads
 )
 
@@ -57,8 +61,6 @@ target_link_libraries(flashshare PRIVATE
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
     target_link_libraries(flashshare PRIVATE stdc++fs)
 endif()
-
-# Windows: link Winsock libraries
 if(WIN32)
     target_link_libraries(flashshare PRIVATE ws2_32 mswsock)
 endif()
