@@ -90,11 +90,21 @@ void RelayRejoinListener::handle_connection(Connection& connection) {
         }
     );
 
-    if (found == known.end() || !membership_->queue_rejoin(request.transfer_id, *found)) {
+    const auto result = found == known.end() ?
+                                RelayMembership::RejoinResult::Rejected :
+                                membership_->queue_rejoin(request.transfer_id, *found);
+
+    if (result == RelayMembership::RejoinResult::Rejected) {
         LOG_WARN("Ignored relay rejoin request from %s", peer_ip.c_str());
         return;
     }
-    LOG_INFO("Queued relay rejoin request from %s for transfer %s", peer_ip.c_str(), request.transfer_id.c_str());
+
+    if (result == RelayMembership::RejoinResult::Queued) {
+        LOG_INFO("Queued relay rejoin request from %s for transfer %s",
+                 peer_ip.c_str(), request.transfer_id.c_str());
+    } else {
+        LOG_INFO("Acknowledged planned relay pause for %s", peer_ip.c_str());
+    }
     
     connection.socket().relay_set_send_timeout(std::chrono::seconds(1));
     connection.socket().set_cork(false);

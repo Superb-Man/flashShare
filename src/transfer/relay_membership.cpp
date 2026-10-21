@@ -59,6 +59,7 @@ bool RelayMembership::activate(const RelayPlan& plan, Clock::time_point now) {
     epoch_ = plan.epoch;
     activated_once_ = true;
     replies_.clear();
+    expected_pause_nodes_.clear();
     poll_open_ = false;
     next_heartbeat_ = now + heartbeat_interval_;
     building_ = false;
@@ -117,11 +118,12 @@ RelayHealthCheck RelayMembership::finish_heartbeat(Clock::time_point now) {
     for (const auto& node : relay_nodes_) {
         if (pending_rejoins_.count(node.address) != 0) result.joining.push_back(node);
     }
-    replies_.clear();
     poll_open_ = false;
 
     const bool no_replies = result.missing.size() == active_nodes_.size();
     if (no_replies && result.joining.empty()) {
+        replies_.clear();
+        expected_pause_nodes_.clear();
         active_nodes_.clear();
         closed_ = true;
         result.close_coordinator = true;
@@ -129,9 +131,16 @@ RelayHealthCheck RelayMembership::finish_heartbeat(Clock::time_point now) {
     }
 
     if (result.missing.empty() && result.joining.empty()) {
+        replies_.clear();
+        expected_pause_nodes_.clear();
         next_heartbeat_ = now + heartbeat_interval_;
         return result;
     }
+
+    // These nodes replied before the deadline. Their old data connections
+    // will close when the coordinator pauses streaming for this rebuild.
+    expected_pause_nodes_ = std::move(replies_);
+    replies_.clear();
 
     active_nodes_.erase(std::remove_if(active_nodes_.begin(), active_nodes_.end(),
         [&](const RelayEndpoint& node) {
@@ -150,15 +159,20 @@ RelayHealthCheck RelayMembership::finish_heartbeat(Clock::time_point now) {
     return result;
 }
 
-bool RelayMembership::queue_rejoin(const std::string& transfer_id,
-                                   const RelayEndpoint& node) {
+RelayMembership::RejoinResult RelayMembership::queue_rejoin(
+    const std::string& transfer_id, const RelayEndpoint& node) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (closed_ || transfer_id != transfer_id_ || !known_node(node)) return false;
+    if (closed_ || transfer_id != transfer_id_ || !known_node(node)) {
+        return RejoinResult::Rejected;
+    }
+    if (building_ && expected_pause_nodes_.count(node.address) != 0) {
+        return RejoinResult::ExpectedPause;
+    }
     // A receiver that restarts before the next heartbeat can still appear
     // active. Its explicit REJOIN_REQ must rebuild the lost data connection.
     std::lock_guard<std::mutex> pending_lock(pending_mutex_);
     pending_rejoins_.insert(node.address);
-    return true;
+    return RejoinResult::Queued;
 }
 
 bool RelayMembership::can_join_current_build(const RelayEndpoint& node) const {

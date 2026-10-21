@@ -34,6 +34,8 @@ public:
     using Clock = std::chrono::steady_clock;
     static constexpr std::chrono::seconds REPLY_TIMEOUT{2};
 
+    enum class RejoinResult { Rejected, ExpectedPause, Queued };
+
     struct HeartbeatPoll {
         bool started = false;
         std::string transfer_id;
@@ -58,8 +60,9 @@ public:
     // closes when nobody replied and nobody requested rejoin.
     RelayHealthCheck finish_heartbeat(Clock::time_point now); // 
 
-    // Records a known node’s rejoin request, deduplicated by IP.
-    bool queue_rejoin(const std::string& transfer_id, const RelayEndpoint& node);
+    // Records a known node's rejoin request. During a rebuild, requests from
+    // timely heartbeat responders are treated as expected stream pauses.
+    RejoinResult queue_rejoin(const std::string& transfer_id, const RelayEndpoint& node);
 
     // Checks whether a node may enter the build underway
     // pending rejoins must wait for the next round.
@@ -81,6 +84,7 @@ private:
     std::vector<RelayEndpoint> active_nodes_;
     std::unordered_set<std::string> pending_rejoins_;
     std::unordered_set<std::string> replies_;
+    std::unordered_set<std::string> expected_pause_nodes_;
     Clock::time_point next_heartbeat_{};
     Clock::time_point reply_deadline_{};
     uint64_t epoch_ = 0;
