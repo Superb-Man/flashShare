@@ -35,6 +35,53 @@ typedef int mode_t;
 
 namespace flashshare {
 
+#ifdef __linux__
+
+// Linux splice requires a pipe between the socket and the regular file.
+class ReceivePipe {
+public:
+    ReceivePipe() : valid_(::pipe(fds_) == 0) {}
+
+    ~ReceivePipe() {
+        if (valid_) {
+            ::close(fds_[0]);
+            ::close(fds_[1]);
+        }
+    }
+
+    ReceivePipe(const ReceivePipe&) = delete;
+    ReceivePipe& operator=(const ReceivePipe&) = delete;
+
+    bool valid() const { return valid_; }
+
+    ssize_t receive_to_file(int socket_fd, int file_fd, size_t count) const {
+        ssize_t pulled;
+        do {
+            pulled = ::splice(socket_fd, nullptr, fds_[1], nullptr, count, 0);
+        } while (pulled < 0 && errno == EINTR);
+
+        if (pulled <= 0) return pulled;
+
+        ssize_t written = 0;
+        while (written < pulled) {
+            ssize_t n = ::splice(fds_[0], nullptr, file_fd, nullptr, static_cast<size_t>(pulled - written), 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) {
+                if (n == 0) errno = EIO;
+                return -1;
+            }
+            written += n;
+        }
+        return pulled;
+    }
+
+private:
+    int fds_[2]{};
+    bool valid_;
+};
+
+#endif
+
 // Global receiver pointer for signal handler
 static Receiver* g_receiver = nullptr;
 
@@ -261,7 +308,16 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
         constexpr size_t BUFFER_SIZE = 256 * 1024;
         constexpr uint64_t CHECKPOINT_INTERVAL = 4 * 1024 * 1024;
 
+#ifdef __linux__
+        ReceivePipe pipe;
+        if (!pipe.valid()) {
+            LOG_ERROR("Cannot create receive pipe: %s", strerror(errno));
+            ::close(fd);
+            return false;
+        }
+#else
         std::vector<uint8_t> buffer(BUFFER_SIZE);
+#endif
         uint64_t last_checkpoint = received;
 
         while (received < file.expected_size) {
@@ -269,11 +325,14 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
                 std::min<uint64_t>(BUFFER_SIZE, file.expected_size - received)
             );
 
+#ifdef __linux__
+            ssize_t n = pipe.receive_to_file(conn.socket().fd(), fd, wanted);
+#else
             ssize_t n = conn.socket().recv(buffer.data(), wanted, 0);
+#endif
             if (n < 0) {
                 if (errno == EINTR) continue;
-
-                LOG_ERROR("recv failed: %s", strerror(errno));
+                LOG_ERROR("File receive failed: %s", strerror(errno));
                 ::close(fd);
                 return false;
             }
@@ -284,6 +343,7 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
                 return false;
             }
 
+#ifndef __linux__
             ssize_t written = 0;
             while (written < n) {
                 ssize_t w = ::write(fd, buffer.data() + written, static_cast<size_t>(n - written));
@@ -296,11 +356,12 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
                 }
                 written += w;
             }
+#endif
 
             received += static_cast<uint64_t>(n);
             progress.update(received);
 
-            // write() already put these bytes in the page cache that
+            // The file now contains these bytes in the page cache that
             // sendfile() reads from, so the forwarding thread can send them
             // onward now rather than waiting for the next fsync checkpoint.
             if (forwarder) {
