@@ -4,6 +4,7 @@
 #include "util/fs.h"
 #include "util/sha256.h"
 #include "transfer/transfer_store.h"
+#include "transfer/checkpoint_worker.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -14,6 +15,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
+#include <thread>
 #include <utility>
 
 #ifdef _WIN32
@@ -238,23 +241,15 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
 
     progress.update(received);
 
+    // Owns fd and keeps journal updates behind the data fsync. If the receive
+    // side fails, its destructor finishes any checkpoint already requested.
+    CheckpointWorker checkpoints(fd, *transfer_store_, transfer, file);
+    constexpr uint64_t MAX_UNCHECKPOINTED = 64 * 1024 * 1024;
+
     auto checkpoint = [&]() -> bool {
-        if (fsync(fd) < 0) {
-            LOG_ERROR("Cannot sync partial file %s: %s",
-                      file.partial_path.c_str(), strerror(errno));
-            return false;
-        }
-
-        if (!transfer_store_->checkpoint(
-                transfer.sender_public_ip,
-                transfer.transfer_id,
-                file.file_index,
-                received)) {
-            return false;
-        }
-
-        file.durable_bytes = received;
-        return true;
+        if (!checkpoints.request(received)) return false;
+        // Keep crash replay bounded if the disk cannot keep up with the wire.
+        return received - checkpoints.durable() < MAX_UNCHECKPOINTED || checkpoints.wait_for(received);
     };
 
     if (!encrypted) {
@@ -272,15 +267,12 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
             ssize_t n = conn.socket().recv(buffer.data(), wanted, 0);
             if (n < 0) {
                 if (errno == EINTR) continue;
-
-                LOG_ERROR("recv failed: %s", strerror(errno));
-                ::close(fd);
+                LOG_ERROR("File receive failed: %s", strerror(errno));
                 return false;
             }
 
             if (n == 0) {
                 LOG_ERROR("Connection closed during file transfer");
-                ::close(fd);
                 return false;
             }
 
@@ -291,7 +283,6 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
                     if (errno == EINTR) continue;
 
                     LOG_ERROR("write failed: %s", strerror(errno));
-                    ::close(fd);
                     return false;
                 }
                 written += w;
@@ -309,7 +300,6 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
 
             if (received - last_checkpoint >= CHECKPOINT_INTERVAL) {
                 if (!checkpoint()) {
-                    ::close(fd);
                     return false;
                 }
                 last_checkpoint = received;
@@ -325,7 +315,6 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
 
             if (!conn.recv_data_chunk(data, sequence)) {
                 LOG_ERROR("Failed to receive encrypted data chunk");
-                ::close(fd);
                 return false;
             }
 
@@ -333,7 +322,6 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
                 data.empty() ||
                 data.size() > file.expected_size - received) {
                 LOG_ERROR("Invalid encrypted chunk for file %u", file.file_index);
-                ::close(fd);
                 return false;
             }
 
@@ -344,7 +332,6 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
                     if (errno == EINTR) continue;
 
                     LOG_ERROR("write failed: %s", strerror(errno));
-                    ::close(fd);
                     return false;
                 }
                 written += static_cast<size_t>(n);
@@ -355,18 +342,18 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
             progress.update(received);
 
             if (!checkpoint()) {
-                ::close(fd);
                 return false;
             }
         }
     }
 
-    if (!checkpoint()) {
-        ::close(fd);
+    if (file.expected_size == 0 && ::fsync(fd) < 0) {
+        LOG_ERROR("Cannot sync empty file %s: %s", file.partial_path.c_str(), strerror(errno));
         return false;
     }
 
-    ::close(fd);
+    if (!checkpoints.wait_for(received)) return false;
+    file.durable_bytes = received;
 
     MessageType type;
     if (!conn.recv_message(type) || type != MessageType::FILE_COMPLETE) {

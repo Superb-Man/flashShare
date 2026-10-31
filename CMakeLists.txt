@@ -28,6 +28,7 @@ add_executable(flashshare
     src/net/threadpool.cpp
     src/transfer/sender.cpp
     src/transfer/transfer_store.cpp
+    src/transfer/checkpoint_worker.cpp
     src/transfer/receiver.cpp
     src/crypto/cipher.cpp
     src/util/logger.cpp
