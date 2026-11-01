@@ -79,10 +79,11 @@ Sender::Sender(std::shared_ptr<const PreparedManifest> manifest,
                bool resume,
                bool show_progress,
                std::string transfer_id,
-               bool relay_chain)
+               bool relay_chain,
+               bool pipe)
     : target_ip_(target_ip), port_(port),
       encrypt_(encrypt), resume_(resume), show_progress_(show_progress),
-      relay_chain_(relay_chain),
+      relay_chain_(relay_chain), pipe_(pipe),
       requested_transfer_id_(std::move(transfer_id)) {
     session_.manifest = std::move(manifest);
 }
@@ -296,6 +297,7 @@ bool Sender::connect_and_negotiate(const TransferSession& session, std::shared_p
     request.encrypted = encrypt_;
     request.resume = resume_;
     request.completion_ack = relay_chain_;
+    request.pipe = relay_chain_ && pipe_;
 
     if (!candidate->send_transfer_request(request)) {
         LOG_ERROR("Failed to send transfer request");

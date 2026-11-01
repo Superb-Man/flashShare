@@ -5,6 +5,7 @@
 #include "util/sha256.h"
 #include "transfer/transfer_store.h"
 #include "transfer/checkpoint_worker.h"
+#include "transfer/receive_pipe.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -37,53 +38,6 @@ typedef int mode_t;
 // separately so they do not occupy a file-transfer worker.
 
 namespace flashshare {
-
-#ifdef __linux__
-
-// Linux splice requires a pipe between the socket and the regular file.
-class ReceivePipe {
-public:
-    ReceivePipe() : valid_(::pipe(fds_) == 0) {}
-
-    ~ReceivePipe() {
-        if (valid_) {
-            ::close(fds_[0]);
-            ::close(fds_[1]);
-        }
-    }
-
-    ReceivePipe(const ReceivePipe&) = delete;
-    ReceivePipe& operator=(const ReceivePipe&) = delete;
-
-    bool valid() const { return valid_; }
-
-    ssize_t receive_to_file(int socket_fd, int file_fd, size_t count) const {
-        ssize_t pulled;
-        do {
-            pulled = ::splice(socket_fd, nullptr, fds_[1], nullptr, count, 0);
-        } while (pulled < 0 && errno == EINTR);
-
-        if (pulled <= 0) return pulled;
-
-        ssize_t written = 0;
-        while (written < pulled) {
-            ssize_t n = ::splice(fds_[0], nullptr, file_fd, nullptr, static_cast<size_t>(pulled - written), 0);
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) {
-                if (n == 0) errno = EIO;
-                return -1;
-            }
-            written += n;
-        }
-        return pulled;
-    }
-
-private:
-    int fds_[2]{};
-    bool valid_;
-};
-
-#endif
 
 // Global receiver pointer for signal handler
 static Receiver* g_receiver = nullptr;
@@ -292,9 +246,13 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
     // side fails, its destructor finishes any checkpoint already requested.
     CheckpointWorker checkpoints(fd, *transfer_store_, transfer, file);
     constexpr uint64_t MAX_UNCHECKPOINTED = 64 * 1024 * 1024;
+    const bool live_relay = forwarder && forwarder->live_pipe_mode();
 
     auto checkpoint = [&]() -> bool {
         if (!checkpoints.request(received)) return false;
+        // Pipe forwarding consumes incoming bytes independently of the
+        // checkpoint worker. Let this relay stream while fsync catches up.
+        if (live_relay) return true;
         // Keep crash replay bounded if the disk cannot keep up with the wire.
         return received - checkpoints.durable() < MAX_UNCHECKPOINTED || checkpoints.wait_for(received);
     };
@@ -304,12 +262,17 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
         constexpr uint64_t CHECKPOINT_INTERVAL = 4 * 1024 * 1024;
 
 #ifdef __linux__
-        ReceivePipe pipe;
-        if (!pipe.valid()) {
+        /**
+         * Create a receive pipe for live relay mode. This pipe will be used
+         * to receive incoming file data directly into the file descriptor.
+         */
+        auto pipe = std::make_shared<ReceivePipe>(live_relay);
+
+        if (!pipe->valid()) {
             LOG_ERROR("Cannot create receive pipe: %s", strerror(errno));
-            ::close(fd);
             return false;
         }
+        if (live_relay && !forwarder->attach_live_pipe(file.file_index, pipe)) return false;
 #else
         std::vector<uint8_t> buffer(BUFFER_SIZE);
 #endif
@@ -321,7 +284,7 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
             );
 
 #ifdef __linux__
-            ssize_t n = pipe.receive_to_file(conn.socket().fd(), fd, wanted);
+            ssize_t n = pipe->receive_to_file(conn.socket().fd(), fd, wanted);
 #else
             ssize_t n = conn.socket().recv(buffer.data(), wanted, 0);
 #endif
@@ -353,10 +316,9 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
             received += static_cast<uint64_t>(n);
             progress.update(received);
 
-            // The file now contains these bytes in the page cache that
-            // sendfile() reads from, so the forwarding thread can send them
-            // onward now rather than waiting for the next fsync checkpoint.
-            if (forwarder) {
+            // The legacy forwarder reads the growing .part file. A live
+            // relay worker drains the second pipe independently.
+            if (forwarder && !forwarder->live_pipe_mode()) {
                 forwarder->publish(file.file_index, received);
             }
 

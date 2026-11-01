@@ -80,6 +80,7 @@ static void print_help() {
         "  --encrypt       Enable AES-256-GCM encryption\n"
         "  --relay         Chain the --to receivers (S -> R1 -> R2 -> R3) instead\n"
         "                  of fanning out to each of them from the sender\n"
+        "  --pipe          Use splice/tee forwarding on fresh Linux relay hops\n"
         "  --resume        Resume an interrupted transfer\n"
         "  --accept-all    Auto-accept incoming transfers (no prompt)\n"
         "  --daemon        Run receiver in background (daemon mode)\n"
@@ -158,6 +159,8 @@ bool parse_args(int argc, char* argv[], Args& args) {
             args.encrypt = true;
         } else if (arg == "--relay") {
             args.relay = true;
+        } else if (arg == "--pipe") {
+            args.pipe = true;
         } else if (arg == "--resume") {
             args.resume = true;
         } else if (arg == "--accept-all") {
@@ -220,6 +223,17 @@ bool parse_args(int argc, char* argv[], Args& args) {
         fprintf(stderr, "Error: --relay is only valid for send\n");
         return false;
     }
+
+    if (args.pipe && (!args.relay || args.command != Command::SEND)) {
+        fprintf(stderr, "Error: --pipe requires send --relay\n");
+        return false;
+    }
+#ifndef __linux__
+    if (args.pipe) {
+        fprintf(stderr, "Error: --pipe requires Linux\n");
+        return false;
+    }
+#endif
 
     return true;
 }

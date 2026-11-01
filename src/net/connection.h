@@ -61,6 +61,7 @@ struct TransferRequest {
     bool encrypted;
     bool resume;
     bool completion_ack = false; // Chain nodes must acknowledge verified completion.
+    bool pipe = false;           // Fresh Linux relay hops use splice/tee when requested.
 };
 
 struct TransferResponse {

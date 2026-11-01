@@ -213,6 +213,7 @@ std::string Connection::serialize_request(const TransferRequest& req) {
     ss << "\"encrypted\":" << (req.encrypted ? "true" : "false") << ",";
     ss << "\"resume\":" << (req.resume ? "true" : "false") << ",";
     ss << "\"completion_ack\":" << (req.completion_ack ? "true" : "false") << ",";
+    ss << "\"pipe\":" << (req.pipe ? "true" : "false") << ",";
     ss << "\"files\":[";
     for (size_t i = 0; i < req.files.size(); ++i) {
         const auto& f = req.files[i];
@@ -235,6 +236,7 @@ bool Connection::deserialize_request(const std::string& json, TransferRequest& r
     req.encrypted = json_get_bool(json, "encrypted");
     req.resume = json_get_bool(json, "resume");
     req.completion_ack = json_get_bool(json, "completion_ack");
+    req.pipe = json_get_bool(json, "pipe");
     req.files = json_get_files(json);
     return true;
 }

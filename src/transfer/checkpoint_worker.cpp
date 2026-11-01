@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <system_error>
 
@@ -75,9 +77,13 @@ uint64_t CheckpointWorker::durable() const {
 }
 
 void CheckpointWorker::run() {
+    // Test delay. It runs on this worker, outside the checkpoint mutex,
+    // immediately before each partial-file sync.
+    std::chrono::milliseconds test_delay{0};
+    
     for (;;) {
         std::unique_lock<std::mutex> lock(mutex_);
-        
+
         changed_.wait(lock, [&] { 
             return stopping_ || pending_ > durable_; 
         });
@@ -86,6 +92,7 @@ void CheckpointWorker::run() {
         const uint64_t offset = pending_;
         lock.unlock();
 
+        if (test_delay.count() > 0) std::this_thread::sleep_for(test_delay);
         bool ok = ::fsync(fd_) == 0;
         if (!ok) {
             LOG_ERROR("Cannot sync partial file %s: %s",

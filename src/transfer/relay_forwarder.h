@@ -13,6 +13,8 @@
 
 namespace flashshare {
 
+class ReceivePipe;
+
 struct RelayFileFlow {
     uint32_t file_index = 0;
 
@@ -49,10 +51,15 @@ public:
     RelayForwarder(const RelayForwarder&) = delete;
     RelayForwarder& operator=(const RelayForwarder&) = delete;
 
-    // Connects downstream, replays the upstream manifest under the same
-    // transfer ID to learn the downstream's own resume offsets
-    // starts the forwarding thread.
+    // Connects downstream and starts its forwarding worker. Fresh unencrypted
+    // Linux transfers use a pipe; resumed transfers use the partial file.
     bool start();
+
+    bool live_pipe_mode() const { return live_pipe_mode_; }
+
+#ifdef __linux__
+    bool attach_live_pipe(uint32_t file_index, std::shared_ptr<ReceivePipe> pipe);
+#endif
 
     // Called by the receive thread after each successful write() to the
     // .part file of this file index. Never blocks on the forwarding thread.
@@ -74,6 +81,7 @@ public:
 private:
     void forward_loop();
     bool forward_file(const RelayFileFlow& file, uint64_t start_offset);
+    bool complete_downstream();
 
     // Waits until this file has more than `sent` bytes stored locally.
     // Returns false if the flow was aborted while waiting.
@@ -90,6 +98,8 @@ private:
 
     std::unique_ptr<Connection> downstream_;
     std::vector<uint64_t> downstream_offsets_;
+    bool live_pipe_mode_ = false;
+    std::vector<std::shared_ptr<ReceivePipe>> live_pipes_; // guarded by mutex_
 
     std::mutex mutex_;
     std::condition_variable data_available_;

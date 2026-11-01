@@ -18,7 +18,9 @@ namespace flashshare {
 // membership change stops the data connection and rebuilds the chain.
 class RelayRecovery {
 public:
-    RelayRecovery(RelayCoordinator& coordinator, std::shared_ptr<RelayMembership> membership, RelayPlan plan);
+    RelayRecovery(RelayCoordinator& coordinator, 
+                  std::shared_ptr<RelayMembership> membership,
+                  RelayPlan plan, bool pipe);
 
     int run();
 
@@ -28,6 +30,7 @@ private:
     RelayCoordinator& coordinator_;
     std::shared_ptr<RelayMembership> membership_;
     RelayPlan plan_;
+    bool pipe_ = false;
 };
 
 } // namespace flashshare

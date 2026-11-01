@@ -76,7 +76,7 @@ int run_relay_send(const Args& args) {
              plan.transfer_id.c_str(), chain.c_str());
 
     if (membership) {
-        RelayRecovery recovery(coordinator, membership, plan);
+        RelayRecovery recovery(coordinator, membership, plan, args.pipe);
         return recovery.run();
     }
 
