@@ -259,8 +259,7 @@ void RelayForwarder::abort() {
 }
 
 // Forwards one file from its live pipe or its growing partial file.
-bool RelayForwarder::forward_file(const RelayFileFlow& file,
-                                  uint64_t start_offset) {
+bool RelayForwarder::forward_file(const RelayFileFlow& file, uint64_t start_offset) {
     if (!downstream_->send_file_header(file.file_index,
                                        file.expected_size,
                                        start_offset,
@@ -296,13 +295,31 @@ bool RelayForwarder::forward_file(const RelayFileFlow& file,
         downstream_->socket().set_cork(false);
         downstream_->socket().set_cork(true);
 
+        /*
+         * Send the remaining live-pipe bytes first. If that pipe fills,
+         * continue on this connection from the matching offset in .part.
+         */
+        bool file_fallback = false;
+
         while (sent < file.expected_size) {
             const size_t wanted = static_cast<size_t>(std::min<uint64_t>(CHUNK_SIZE, file.expected_size - sent));
             const ssize_t n = pipe->forward_to_socket(downstream_->socket().fd(), wanted);
             
-            if (n <= 0) {
-                fail("Cannot splice live relay bytes downstream for " + file.relpath +
-                     ": " + (n == 0 ? "socket closed" : strerror(errno)));
+            if (n == 0) {
+                uint64_t switch_offset = 0;
+                if (!pipe->fallback_offset(switch_offset) || switch_offset != sent) {
+                    fail("Relay pipe fallback offset mismatch for " + file.relpath);
+                    return false;
+                }
+                LOG_INFO("Relay pipe filled for %s; continuing from .part at %llu",
+                         file.relpath.c_str(),
+                         static_cast<unsigned long long>(switch_offset));
+                file_fallback = true;
+                break;
+            }
+
+            if (n < 0) {
+                fail("Cannot splice live relay bytes downstream for " + file.relpath + strerror(errno));
                 return false;
             }
 
@@ -310,25 +327,33 @@ bool RelayForwarder::forward_file(const RelayFileFlow& file,
             bytes_forwarded_ += static_cast<uint64_t>(n);
         }
 
-        if (!wait_for_verified(file.file_index)) 
-            return false;
+        if (!file_fallback) {
 
-        if (!downstream_->send_message(MessageType::FILE_COMPLETE)) {
-            fail("Cannot send downstream FILE_COMPLETE for " + file.relpath);
-            return false;
+            if (!wait_for_verified(file.file_index)) 
+                return false;
+
+            if (!downstream_->send_message(MessageType::FILE_COMPLETE)) {
+                fail("Cannot send downstream FILE_COMPLETE for " + file.relpath);
+                return false;
+            }
+            downstream_->socket().set_cork(false);
+            downstream_->socket().set_cork(true);
+
+
+            return true;
         }
-        downstream_->socket().set_cork(false);
-        downstream_->socket().set_cork(true);
-
-
-        return true;
+        // Pipe B has been drained. The common sendfile path below starts at
+        // the first byte that was never queued into B on the same socket.
     }
 #endif
 
     // The downstream node already holds this whole file. It still expects
     // FILE_COMPLETE so its multi-file stream stays aligned.
     if (sent >= file.expected_size) {
-        if (!wait_for_verified(file.file_index)) return false;
+        if (!wait_for_verified(file.file_index)) {
+            return false;
+        }
+
         const bool sent_complete = downstream_->send_message(MessageType::FILE_COMPLETE);
         downstream_->socket().set_cork(false);
         downstream_->socket().set_cork(true);

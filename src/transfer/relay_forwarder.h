@@ -61,8 +61,8 @@ public:
     bool attach_live_pipe(uint32_t file_index, std::shared_ptr<ReceivePipe> pipe);
 #endif
 
-    // Called by the receive thread after each successful write() to the
-    // .part file of this file index. Never blocks on the forwarding thread.
+    // Called after bytes reach .part: by the receive thread in file mode,
+    // or by the partial-file writer in live pipe mode.
     void publish(uint32_t file_index, uint64_t available);
 
     // Called only after this node has verified and finalized the file.

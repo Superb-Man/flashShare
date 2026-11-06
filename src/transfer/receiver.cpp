@@ -250,9 +250,9 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
 
     auto checkpoint = [&]() -> bool {
         if (!checkpoints.request(received)) return false;
-        // Pipe forwarding consumes incoming bytes independently of the
-        // checkpoint worker. Let this relay stream while fsync catches up.
-        if (live_relay) return true;
+        // // Pipe forwarding consumes incoming bytes independently of the
+        // // checkpoint worker. Let this relay stream while fsync catches up.
+        // if (live_relay) return true;
         // Keep crash replay bounded if the disk cannot keep up with the wire.
         return received - checkpoints.durable() < MAX_UNCHECKPOINTED || checkpoints.wait_for(received);
     };
@@ -272,11 +272,47 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
             LOG_ERROR("Cannot create receive pipe: %s", strerror(errno));
             return false;
         }
+
+        /*
+         * Join the writer if receiving exits early, so it cannot keep using
+         * this file after the receive operation ends.
+         */
+        struct WriterGuard {
+            ReceivePipe* pipe;
+            ~WriterGuard() { if (pipe) pipe->finish_writer(); }
+        } writer_guard{nullptr};
+
+        /*
+         * Start the .part writer. As it saves bytes, publish the written
+         * offset for fallback forwarding and request checkpoints.
+         */
+        if (live_relay) {
+            const uint64_t start = received;
+            const uint32_t index = file.file_index;
+            if (!pipe->start_writer(fd,
+                    [forwarder, &checkpoints, start, index,
+                     last_checkpoint = start](uint64_t written) mutable {
+                        const uint64_t offset = start + written;
+                        forwarder->publish(index, offset);
+                        if (offset - last_checkpoint >= CHECKPOINT_INTERVAL) {
+                            if (!checkpoints.request(offset)) return false;
+                            last_checkpoint = offset;
+                        }
+                        return true;
+                    })) {
+                LOG_ERROR("Cannot start relay partial-file writer");
+                return false;
+            }
+            writer_guard.pipe = pipe.get();
+        }
+
+
         if (live_relay && !forwarder->attach_live_pipe(file.file_index, pipe)) return false;
 #else
         std::vector<uint8_t> buffer(BUFFER_SIZE);
 #endif
         uint64_t last_checkpoint = received;
+        // bool publish_bytes = !live_relay;
 
         while (received < file.expected_size) {
             const size_t wanted = static_cast<size_t>(
@@ -316,19 +352,39 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
             received += static_cast<uint64_t>(n);
             progress.update(received);
 
-            // The legacy forwarder reads the growing .part file. A live
-            // relay worker drains the second pipe independently.
-            if (forwarder && !forwarder->live_pipe_mode()) {
+//             // After Pipe B fills, the live forwarder also needs the growing
+//             // .part offsets for its sendfile fallback.
+// #ifdef __linux__
+//             if (live_relay && !publish_bytes) {
+//                 uint64_t switch_offset = 0;
+//                 publish_bytes = pipe->fallback_offset(switch_offset);
+//             }
+// #endif
+            
+            // The relay writer publishes saved offsets for sendfile fallback.
+            if (forwarder && !live_relay) {
                 forwarder->publish(file.file_index, received);
             }
 
-            if (received - last_checkpoint >= CHECKPOINT_INTERVAL) {
+            if (!live_relay && received - last_checkpoint >= CHECKPOINT_INTERVAL) {
                 if (!checkpoint()) {
                     return false;
                 }
                 last_checkpoint = received;
             }
         }
+        
+#ifdef __linux__
+        /*
+         * Make sure the last queued bytes are in .part before the final
+         * checkpoint and file verification.
+         */
+        if (live_relay && !pipe->finish_writer()) {
+            LOG_ERROR("Cannot finish relay partial-file write: %s", strerror(errno));
+            return false;
+        }
+#endif
+
     } else {
 
         uint32_t expected_seq = static_cast<uint32_t>(received / CHUNK_SIZE);
