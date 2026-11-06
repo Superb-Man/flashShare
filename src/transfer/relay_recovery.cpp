@@ -79,10 +79,11 @@ struct AttemptState {
 
 RelayRecovery::RelayRecovery(RelayCoordinator& coordinator,
                              std::shared_ptr<RelayMembership> membership,
-                             RelayPlan plan)
+                             RelayPlan plan,
+                             bool pipe)
     : coordinator_(coordinator),
       membership_(std::move(membership)),
-      plan_(std::move(plan)) {}
+      plan_(std::move(plan)), pipe_(pipe) {}
 
 bool RelayRecovery::rebuild(const RelayHealthCheck& check) {
 
@@ -172,8 +173,14 @@ int RelayRecovery::run() {
         const RelayEndpoint head = plan_.nodes.front();
         
         auto sender = std::make_shared<Sender>(
-            coordinator_.manifest(), head.address, head.port,
-            false, true, true, plan_.transfer_id, true
+            coordinator_.manifest(), 
+            head.address, head.port,
+            false, 
+            true, 
+            true, 
+            plan_.transfer_id, 
+            true, 
+            pipe_
         );
 
         auto state = std::make_shared<AttemptState>();

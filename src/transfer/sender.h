@@ -33,7 +33,8 @@ public:
            bool resume,
            bool show_progress = false,
            std::string transfer_id = "",
-           bool relay_chain = false);
+           bool relay_chain = false,
+           bool pipe = false);
 
     // Run the send operation
     int run();
@@ -72,6 +73,7 @@ private:
     bool resume_;
     bool show_progress_ = true;
     bool relay_chain_ = false;
+    bool pipe_ = false;
     std::string requested_transfer_id_;
 
     TransferSession session_;

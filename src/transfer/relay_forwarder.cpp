@@ -1,5 +1,6 @@
 #include "transfer/relay_forwarder.h"
 
+#include "transfer/receive_pipe.h"
 #include "transfer/scoped_file.h"
 #include "util/logger.h"
 
@@ -15,11 +16,9 @@
 #include <unistd.h>
 #endif
 
-// Streams bytes already stored by a relay receiver to its downstream node.
-// It waits for newly received ranges, forwards them on one data connection,
-// and passes downstream completion back upstream.
-// Publishing a newly stored range wakes the forwarder, so it can send
-// live data without waiting for the whole file to arrive.
+// Forwards a relay transfer over one downstream connection. Fresh unencrypted
+// Linux transfers splice duplicated incoming pipe buffers on a forwarding
+// worker; resumed transfers retain the existing .part-file forwarding path.
 
 namespace flashshare {
 
@@ -33,6 +32,7 @@ RelayForwarder::RelayForwarder(std::string downstream_address,
       files_(std::move(files)) {
     available_.reserve(files_.size());
     verified_.reserve(files_.size());
+    live_pipes_.resize(files_.size());
 
     // A file finished during an earlier connection has all of its bytes
     // available immediately; a partially received one starts from whatever
@@ -128,6 +128,20 @@ bool RelayForwarder::start() {
     downstream->socket().relay_set_recv_timeout(std::chrono::milliseconds(0));
     downstream_ = std::move(downstream);
 
+#ifdef __linux__
+    /**
+     * Determine if live pipe mode can be enabled based on the upstream request
+     * and the state of the files.
+     */
+    live_pipe_mode_ = upstream_request_.pipe && !upstream_request_.encrypted;
+    for (size_t i = 0; i < files_.size(); ++i) {
+        if (files_[i].completed || files_[i].initial_available != 0 || downstream_offsets_[i] != 0) {
+            live_pipe_mode_ = false;
+            break;
+        }
+    }
+#endif
+
     LOG_INFO("Relaying transfer %s downstream to %s:%u",
              upstream_request_.transfer_id.c_str(),
              downstream_address_.c_str(),
@@ -136,6 +150,27 @@ bool RelayForwarder::start() {
     thread_ = std::thread(&RelayForwarder::forward_loop, this);
     return true;
 }
+
+#ifdef __linux__
+
+/**
+ * Attach a live pipe for the specified file index.
+ * Returns true if the pipe was successfully attached, false otherwise.
+ */
+bool RelayForwarder::attach_live_pipe(uint32_t file_index, std::shared_ptr<ReceivePipe> pipe) {
+    if (!live_pipe_mode_ || !pipe || !pipe->valid()) return false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (aborted_ || file_index >= live_pipes_.size() || live_pipes_[file_index]) {
+            return false;
+        }
+        live_pipes_[file_index] = std::move(pipe);
+    }
+
+    data_available_.notify_all();
+    return true;
+}
+#endif
 
 void RelayForwarder::publish(uint32_t file_index, uint64_t available) {
     {
@@ -199,19 +234,32 @@ bool RelayForwarder::wait_for_upstream_complete() {
 }
 
 void RelayForwarder::abort() {
+#ifdef __linux__
+    std::vector<std::shared_ptr<ReceivePipe>> pipes;
+#endif
     {
         std::lock_guard<std::mutex> lock(mutex_);
         aborted_ = true;
+#ifdef __linux__
+        pipes = live_pipes_;
+#endif
     }
     data_available_.notify_all();
+#ifdef __linux__
+    /**
+     * Abort all live pipes to ensure that any blocked operations are interrupted.
+     */
+    for (const auto& pipe : pipes) {
+        if (pipe) pipe->abort();
+    }
+#endif
     // A rebuilding upstream must also wake a forwarding worker blocked in
     // downstream sendfile() or waiting for its completion acknowledgement.
     if (downstream_) downstream_->socket().shutdown_both();
 }
 
-// Forwards one file, following its .part as the receive thread grows it.
-bool RelayForwarder::forward_file(const RelayFileFlow& file,
-                                  uint64_t start_offset) {
+// Forwards one file from its live pipe or its growing partial file.
+bool RelayForwarder::forward_file(const RelayFileFlow& file, uint64_t start_offset) {
     if (!downstream_->send_file_header(file.file_index,
                                        file.expected_size,
                                        start_offset,
@@ -222,10 +270,90 @@ bool RelayForwarder::forward_file(const RelayFileFlow& file,
 
     uint64_t sent = start_offset;
 
+#ifdef __linux__
+
+    /**
+     * If live pipe mode is enabled, we need to wait for the live pipe
+     * corresponding to this file to become available before forwarding.
+     */
+    if (live_pipe_mode_) {
+        std::shared_ptr<ReceivePipe> pipe;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            
+            // Wait until the live pipe for this file becomes available or the forwarder is aborted.
+            // If the forwarder is aborted while waiting, the wait will exit and the function will return false.
+            data_available_.wait(lock, [&] {
+                return aborted_ || live_pipes_[file.file_index] != nullptr;
+            });
+            if (aborted_) return false;
+            pipe = live_pipes_[file.file_index];
+        }
+
+        // Header and bytes share one socket, but the receive thread writes
+        // Pipe A to disk while this worker drains Pipe B downstream.
+        downstream_->socket().set_cork(false);
+        downstream_->socket().set_cork(true);
+
+        /*
+         * Send the remaining live-pipe bytes first. If that pipe fills,
+         * continue on this connection from the matching offset in .part.
+         */
+        bool file_fallback = false;
+
+        while (sent < file.expected_size) {
+            const size_t wanted = static_cast<size_t>(std::min<uint64_t>(CHUNK_SIZE, file.expected_size - sent));
+            const ssize_t n = pipe->forward_to_socket(downstream_->socket().fd(), wanted);
+            
+            if (n == 0) {
+                uint64_t switch_offset = 0;
+                if (!pipe->fallback_offset(switch_offset) || switch_offset != sent) {
+                    fail("Relay pipe fallback offset mismatch for " + file.relpath);
+                    return false;
+                }
+                LOG_INFO("Relay pipe filled for %s; continuing from .part at %llu",
+                         file.relpath.c_str(),
+                         static_cast<unsigned long long>(switch_offset));
+                file_fallback = true;
+                break;
+            }
+
+            if (n < 0) {
+                fail("Cannot splice live relay bytes downstream for " + file.relpath + strerror(errno));
+                return false;
+            }
+
+            sent += static_cast<uint64_t>(n);
+            bytes_forwarded_ += static_cast<uint64_t>(n);
+        }
+
+        if (!file_fallback) {
+
+            if (!wait_for_verified(file.file_index)) 
+                return false;
+
+            if (!downstream_->send_message(MessageType::FILE_COMPLETE)) {
+                fail("Cannot send downstream FILE_COMPLETE for " + file.relpath);
+                return false;
+            }
+            downstream_->socket().set_cork(false);
+            downstream_->socket().set_cork(true);
+
+
+            return true;
+        }
+        // Pipe B has been drained. The common sendfile path below starts at
+        // the first byte that was never queued into B on the same socket.
+    }
+#endif
+
     // The downstream node already holds this whole file. It still expects
     // FILE_COMPLETE so its multi-file stream stays aligned.
     if (sent >= file.expected_size) {
-        if (!wait_for_verified(file.file_index)) return false;
+        if (!wait_for_verified(file.file_index)) {
+            return false;
+        }
+
         const bool sent_complete = downstream_->send_message(MessageType::FILE_COMPLETE);
         downstream_->socket().set_cork(false);
         downstream_->socket().set_cork(true);
@@ -330,10 +458,13 @@ void RelayForwarder::forward_loop() {
 
     if (!wait_for_upstream_complete()) return;
 
+    if (!complete_downstream()) abort();
+}
+
+bool RelayForwarder::complete_downstream() {
     if (!downstream_->send_message(MessageType::TRANSFER_COMPLETE)) {
         fail("Cannot send downstream TRANSFER_COMPLETE");
-        abort();
-        return;
+        return false;
     }
 
     if (upstream_request_.completion_ack) {
@@ -341,7 +472,7 @@ void RelayForwarder::forward_loop() {
         MessageType reply{};
         if (!downstream_->recv_message(reply) || reply != MessageType::TRANSFER_ACK) {
             fail("Downstream relay chain did not confirm completion");
-            return;
+            return false;
         }
     }
 
@@ -350,6 +481,7 @@ void RelayForwarder::forward_loop() {
              downstream_address_.c_str(),
              downstream_port_,
              static_cast<unsigned long long>(bytes_forwarded_.load()));
+    return true;
 }
 
 bool RelayForwarder::finish() {

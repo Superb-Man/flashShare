@@ -5,6 +5,7 @@
 #include "util/sha256.h"
 #include "transfer/transfer_store.h"
 #include "transfer/checkpoint_worker.h"
+#include "transfer/receive_pipe.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -245,9 +246,13 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
     // side fails, its destructor finishes any checkpoint already requested.
     CheckpointWorker checkpoints(fd, *transfer_store_, transfer, file);
     constexpr uint64_t MAX_UNCHECKPOINTED = 64 * 1024 * 1024;
+    const bool live_relay = forwarder && forwarder->live_pipe_mode();
 
     auto checkpoint = [&]() -> bool {
         if (!checkpoints.request(received)) return false;
+        // // Pipe forwarding consumes incoming bytes independently of the
+        // // checkpoint worker. Let this relay stream while fsync catches up.
+        // if (live_relay) return true;
         // Keep crash replay bounded if the disk cannot keep up with the wire.
         return received - checkpoints.durable() < MAX_UNCHECKPOINTED || checkpoints.wait_for(received);
     };
@@ -256,15 +261,69 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
         constexpr size_t BUFFER_SIZE = 256 * 1024;
         constexpr uint64_t CHECKPOINT_INTERVAL = 4 * 1024 * 1024;
 
+#ifdef __linux__
+        /**
+         * Create a receive pipe for live relay mode. This pipe will be used
+         * to receive incoming file data directly into the file descriptor.
+         */
+        auto pipe = std::make_shared<ReceivePipe>(live_relay);
+
+        if (!pipe->valid()) {
+            LOG_ERROR("Cannot create receive pipe: %s", strerror(errno));
+            return false;
+        }
+
+        /*
+         * Join the writer if receiving exits early, so it cannot keep using
+         * this file after the receive operation ends.
+         */
+        struct WriterGuard {
+            ReceivePipe* pipe;
+            ~WriterGuard() { if (pipe) pipe->finish_writer(); }
+        } writer_guard{nullptr};
+
+        /*
+         * Start the .part writer. As it saves bytes, publish the written
+         * offset for fallback forwarding and request checkpoints.
+         */
+        if (live_relay) {
+            const uint64_t start = received;
+            const uint32_t index = file.file_index;
+            if (!pipe->start_writer(fd,
+                    [forwarder, &checkpoints, start, index,
+                     last_checkpoint = start](uint64_t written) mutable {
+                        const uint64_t offset = start + written;
+                        forwarder->publish(index, offset);
+                        if (offset - last_checkpoint >= CHECKPOINT_INTERVAL) {
+                            if (!checkpoints.request(offset)) return false;
+                            last_checkpoint = offset;
+                        }
+                        return true;
+                    })) {
+                LOG_ERROR("Cannot start relay partial-file writer");
+                return false;
+            }
+            writer_guard.pipe = pipe.get();
+        }
+
+
+        if (live_relay && !forwarder->attach_live_pipe(file.file_index, pipe)) return false;
+#else
         std::vector<uint8_t> buffer(BUFFER_SIZE);
+#endif
         uint64_t last_checkpoint = received;
+        // bool publish_bytes = !live_relay;
 
         while (received < file.expected_size) {
             const size_t wanted = static_cast<size_t>(
                 std::min<uint64_t>(BUFFER_SIZE, file.expected_size - received)
             );
 
+#ifdef __linux__
+            ssize_t n = pipe->receive_to_file(conn.socket().fd(), fd, wanted);
+#else
             ssize_t n = conn.socket().recv(buffer.data(), wanted, 0);
+#endif
             if (n < 0) {
                 if (errno == EINTR) continue;
                 LOG_ERROR("File receive failed: %s", strerror(errno));
@@ -276,6 +335,7 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
                 return false;
             }
 
+#ifndef __linux__
             ssize_t written = 0;
             while (written < n) {
                 ssize_t w = ::write(fd, buffer.data() + written, static_cast<size_t>(n - written));
@@ -287,24 +347,44 @@ bool Receiver::recv_file(Connection& conn, StoredTransfer& transfer,
                 }
                 written += w;
             }
+#endif
 
             received += static_cast<uint64_t>(n);
             progress.update(received);
 
-            // write() already put these bytes in the page cache that
-            // sendfile() reads from, so the forwarding thread can send them
-            // onward now rather than waiting for the next fsync checkpoint.
-            if (forwarder) {
+//             // After Pipe B fills, the live forwarder also needs the growing
+//             // .part offsets for its sendfile fallback.
+// #ifdef __linux__
+//             if (live_relay && !publish_bytes) {
+//                 uint64_t switch_offset = 0;
+//                 publish_bytes = pipe->fallback_offset(switch_offset);
+//             }
+// #endif
+            
+            // The relay writer publishes saved offsets for sendfile fallback.
+            if (forwarder && !live_relay) {
                 forwarder->publish(file.file_index, received);
             }
 
-            if (received - last_checkpoint >= CHECKPOINT_INTERVAL) {
+            if (!live_relay && received - last_checkpoint >= CHECKPOINT_INTERVAL) {
                 if (!checkpoint()) {
                     return false;
                 }
                 last_checkpoint = received;
             }
         }
+        
+#ifdef __linux__
+        /*
+         * Make sure the last queued bytes are in .part before the final
+         * checkpoint and file verification.
+         */
+        if (live_relay && !pipe->finish_writer()) {
+            LOG_ERROR("Cannot finish relay partial-file write: %s", strerror(errno));
+            return false;
+        }
+#endif
+
     } else {
 
         uint32_t expected_seq = static_cast<uint32_t>(received / CHUNK_SIZE);
@@ -545,10 +625,17 @@ void Receiver::load_relay_assignments() {
     }
 }
 
-void Receiver::remove_relay_assignment(const std::string& transfer_id) const {
+void Receiver::remove_relay_assignment(const std::string& transfer_id) {
+    std::lock_guard<std::mutex> assignment_lock(relay_assignments_mutex_);
     std::error_code error;
     std::filesystem::remove(relay_assignment_path(transfer_id), error);
     if (error) LOG_WARN("Cannot remove completed relay assignment: %s", error.message().c_str());
+
+    relay_assignments_.erase(transfer_id);
+    {
+        std::lock_guard<std::mutex> rejoin_lock(rejoin_mutex_);
+        rejoin_pending_.erase(transfer_id);
+    }
 }
 
 bool Receiver::request_rejoin(
@@ -597,7 +684,12 @@ void Receiver::queue_rejoin(const std::string& transfer_id,
                             const RelayAssignment& assignment) {
     if (assignment.coordinator_rejoin_port == 0) return;
     {
-        std::lock_guard<std::mutex> lock(rejoin_mutex_);
+        std::lock_guard<std::mutex> assignment_lock(relay_assignments_mutex_);
+        const auto current = relay_assignments_.find(transfer_id);
+        if (current == relay_assignments_.end() ||
+            current->second.epoch != assignment.epoch) return;
+
+        std::lock_guard<std::mutex> rejoin_lock(rejoin_mutex_);
         rejoin_pending_[transfer_id] = assignment;
     }
     rejoin_changed_.notify_one();
@@ -1202,7 +1294,6 @@ int Receiver::handle_connection(Connection& conn) {
             return 1;
         }
         conn.socket().set_cork(false);
-        remove_relay_assignment(stored_transfer->transfer_id);
     }
 
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - overall_start).count();
